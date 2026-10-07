@@ -1,26 +1,13 @@
-cmake_minimum_required(VERSION 3.22.1)
+cmake_minimum_required(VERSION 3.18.1)
 project("androidaimanager")
 
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(LLAMA_BUILD_SERVER OFF CACHE BOOL "" FORCE)
+# Флаги оптимизации под ARM64
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -funroll-loops -march=armv8-a+dotprod")
 
 add_subdirectory(llama.cpp)
 
-add_library(
-        native-lib
-        SHARED
-        native-lib.cpp
-)
+add_library(native-lib SHARED native-lib.cpp)
 
-find_library(
-        log-lib
-        log
-)
-
-target_link_libraries(
-        native-lib
+target_link_libraries(native-lib
         llama
-        ${log-lib}
-)
+        log)

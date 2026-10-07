@@ -17,15 +17,21 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // ИЗМЕНЕНИЕ: Отключаем 32-битный armeabi-v7a (который вызывает ошибку vld1q_f16 в llama.cpp)
-        // Сборка идет только под 64-битный ARM и эмулятор x86_64
+        // Сборка только под 64-битный ARM и эмулятор x86_64
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
 
         externalNativeBuild {
             cmake {
-                cppFlags += "-std=c++17"
+                // Передаем CMake флаги для максимальной производительности (Release + O3)
+                arguments(
+                    "-DCMAKE_BUILD_TYPE=Release",
+                    "-DANDROID_ARM_NEON=ON",
+                    "-DLLAMA_BUILD_EXAMPLES=OFF",
+                    "-DLLAMA_BUILD_TESTS=OFF"
+                )
+                cppFlags += listOf("-std=c++17", "-O3", "-funroll-loops")
             }
         }
     }
@@ -82,7 +88,7 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
-// ИЗМЕНЕНИЕ: Безопасное скачивание GGUF-модели через curl без использования java.net.*
+// Скачивание GGUF-модели через curl
 tasks.register("downloadModel") {
     val modelDir = file("src/main/assets")
     val modelFile = file("src/main/assets/qwen2.5-0.5b-instruct-q4_k_m.gguf")
