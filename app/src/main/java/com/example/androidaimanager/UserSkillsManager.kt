@@ -1,6 +1,8 @@
 package com.example.androidaimanager
 
 import android.content.Context
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -8,15 +10,24 @@ import java.io.File
 data class UserSkill(
     val name: String,
     val description: String,
-    val actionType: String, // "http", "shell", "intent"
-    val config: JSONObject  // url, method, body_template, cmd, package, extra_text
+    val actionType: String, // "http", "shell"
+    val config: JSONObject
 )
 
 class UserSkillsManager(context: Context) {
     private val skillsFile = File(context.filesDir, "user_skills.json")
+    private val mutex = Mutex()
+    private var cachedSkills: List<UserSkill> = emptyList()
 
-    fun getAllSkills(): List<UserSkill> {
-        if (!skillsFile.exists()) return emptyList()
+    init {
+        loadIntoMemory()
+    }
+
+    private fun loadIntoMemory() {
+        if (!skillsFile.exists()) {
+            cachedSkills = emptyList()
+            return
+        }
         val skills = mutableListOf<UserSkill>()
         try {
             val jsonArray = JSONArray(skillsFile.readText())
@@ -25,7 +36,7 @@ class UserSkillsManager(context: Context) {
                 skills.add(
                     UserSkill(
                         name = obj.getString("name"),
-                        description = obj.getString("description"),
+                        description = obj.optString("description", "User Skill"),
                         actionType = obj.getString("actionType"),
                         config = obj.getJSONObject("config")
                     )
@@ -34,13 +45,21 @@ class UserSkillsManager(context: Context) {
         } catch (e: Exception) {
             e.printStackTrace()
         }
-        return skills
+        cachedSkills = skills
     }
 
-    fun addSkill(skill: UserSkill) {
-        val current = getAllSkills().toMutableList()
-        current.removeAll { it.name == skill.name } // Перезаписываем, если навык с таким именем уже есть
+    suspend fun getAllSkills(): List<UserSkill> = mutex.withLock {
+        if (cachedSkills.isEmpty() && skillsFile.exists()) {
+            loadIntoMemory()
+        }
+        return cachedSkills
+    }
+
+    suspend fun addSkill(skill: UserSkill) = mutex.withLock {
+        val current = cachedSkills.toMutableList()
+        current.removeAll { it.name.equals(skill.name, ignoreCase = true) }
         current.add(skill)
+
         val jsonArray = JSONArray()
         current.forEach { item ->
             val obj = JSONObject().apply {
@@ -52,5 +71,13 @@ class UserSkillsManager(context: Context) {
             jsonArray.put(obj)
         }
         skillsFile.writeText(jsonArray.toString(2))
+        cachedSkills = current
+    }
+
+    suspend fun clearAllSkills() = mutex.withLock {
+        if (skillsFile.exists()) {
+            skillsFile.delete()
+        }
+        cachedSkills = emptyList()
     }
 }
