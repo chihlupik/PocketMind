@@ -1,320 +1,299 @@
 package com.example.androidaimanager
 
 import android.app.Application
-import android.content.Context
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateListOf
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.File
-import java.io.FileOutputStream
 import java.io.InputStreamReader
-import java.io.OutputStreamWriter
-import java.net.HttpURLConnection
-import java.net.URL
 
-data class ChatMessage(val role: String, val text: String)
+data class ChatMessage(
+    val role: String,
+    val text: String
+)
 
 class AiViewModel(application: Application) : AndroidViewModel(application) {
-    companion object {
-        init {
-            System.loadLibrary("native-lib")
-        }
-    }
 
-    private external fun initModelNative(modelPath: String): Boolean
-    private external fun generateNative(prompt: String, logCallback: (String) -> Unit): String
-    private external fun freeModelNative()
+    private val _chatMessages = MutableStateFlow<List<ChatMessage>>(emptyList())
+    val chatMessages: StateFlow<List<ChatMessage>> = _chatMessages
 
-    val chatMessages = mutableStateListOf<ChatMessage>()
-    val logList = mutableStateListOf<String>()
+    private val _logList = MutableStateFlow<List<String>>(emptyList())
+    val logList: StateFlow<List<String>> = _logList
 
-    var statusText by mutableStateOf("Loading AI model...")
-    var isAiReady by mutableStateOf(false)
-    var isGenerating by mutableStateOf(false)
+    private val _statusText = MutableStateFlow("Initializing model...")
+    val statusText: StateFlow<String> = _statusText
 
-    private val skillsManager = UserSkillsManager(application)
+    private val _isAiReady = MutableStateFlow(false)
+    val isAiReady: StateFlow<Boolean> = _isAiReady
+
+    private val _isGenerating = MutableStateFlow(false)
+    val isGenerating: StateFlow<Boolean> = _isGenerating
+
+    private val userSkillsManager = UserSkillsManager(application)
+
+    // Постоянная рабочая директория (сохраняет состояние между командами cd)
+    private var currentDir = "/storage/emulated/0"
 
     init {
-        initializeAi()
+        System.loadLibrary("native-lib")
+        initAiModel()
     }
 
-    fun addLog(msg: String) {
-        viewModelScope.launch(Dispatchers.Main) {
-            logList.add(msg)
+    private fun initAiModel() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val modelFile = File(getApplication<Application>().filesDir, "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+            val success = initModelNative(modelFile.absolutePath)
+            _isAiReady.value = success
+            _statusText.value = if (success) "Model Ready" else "Model Init Failed"
+            addLog(if (success) "[App] Model initialized successfully" else "[App] Failed to initialize model")
         }
     }
 
-    private fun initializeAi() {
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                addLog("[App] Preparing model from assets...")
-                val modelName = "qwen2.5-0.5b-instruct-q4_k_m.gguf"
+    /**
+     * Главная точка входа. Все базовые команды обрабатываются мгновенно,
+     * исключая любые галлюцинации LLM.
+     */
+    fun processCommand(input: String) {
+        val trimmedInput = input.trim()
+        if (trimmedInput.isEmpty()) return
 
-                val file = copyAssetToFile(getApplication(), modelName)
+        appendUserMessage(trimmedInput)
 
-                addLog("[App] Initializing native model...")
-                val success = initModelNative(file.absolutePath)
-
-                withContext(Dispatchers.Main) {
-                    if (success) {
-                        statusText = "Model Ready (${file.length() / 1024 / 1024} MB)"
-                        isAiReady = true
-                        addLog("[App] PocketMind Engine Initialized Successfully!")
+        when {
+            // 1. Смена директории (cd <folder>) с сохранением пути
+            trimmedInput.startsWith("cd ", ignoreCase = true) -> {
+                val target = trimmedInput.substring(3).trim()
+                viewModelScope.launch(Dispatchers.IO) {
+                    val testCmd = "cd '$currentDir' && cd '$target' && pwd"
+                    val result = executeShellCommandInternal(testCmd)
+                    if (!result.contains("[Err]") && !result.contains("error", true)) {
+                        currentDir = result.trim()
+                        appendBotMessage("Directory changed to: $currentDir")
+                        addLog("[Shell] cd -> $currentDir")
                     } else {
-                        statusText = "Failed to initialize model"
-                        addLog("[App] ERROR: Native model init failed.")
+                        appendBotMessage("Directory not found or access denied: $target")
                     }
                 }
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    statusText = "Error: ${e.localizedMessage}"
-                    addLog("[App] Exception: ${e.localizedMessage}")
+            }
+
+            // 2. Текущая рабочая директория (pwd)
+            trimmedInput.equals("pwd", ignoreCase = true) -> {
+                appendBotMessage(currentDir)
+            }
+
+            // 3. Список файлов в текущей папке (ls / dir)
+            trimmedInput.equals("ls", ignoreCase = true) || trimmedInput.equals("dir", ignoreCase = true) -> {
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal("ls -la")
+                    appendBotMessage(result)
                 }
             }
-        }
-    }
 
-    private fun copyAssetToFile(context: Context, assetName: String): File {
-        val file = File(context.filesDir, assetName)
-        if (!file.exists()) {
-            addLog("[App] Extracting model (first launch may take a few seconds)...")
-            context.assets.open(assetName).use { input ->
-                FileOutputStream(file).use { output ->
-                    input.copyTo(output)
+            // 4. Создание папки (mkdir <name>)
+            trimmedInput.startsWith("mkdir ", ignoreCase = true) -> {
+                val dirName = trimmedInput.substring(6).trim()
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal("mkdir -p '$dirName'")
+                    appendBotMessage("Directory '$dirName' processed.\n$result")
+                    addLog("[Shell] mkdir $dirName")
                 }
             }
-            addLog("[App] Model extracted successfully.")
-        }
-        return file
-    }
 
-    fun processCommand(userText: String) {
-        if (userText.isBlank() || isGenerating) return
-
-        chatMessages.add(ChatMessage("user", userText))
-        isGenerating = true
-
-        viewModelScope.launch(Dispatchers.Default) {
-            val assistantIndex = chatMessages.size
-            chatMessages.add(ChatMessage("assistant", "Executing..."))
-
-            val responseText = executeUserIntent(userText) { log -> addLog(log) }
-
-            withContext(Dispatchers.Main) {
-                chatMessages[assistantIndex] = ChatMessage("assistant", responseText)
-                isGenerating = false
+            // 5. Удаление файла или папки (rm <name>)
+            trimmedInput.startsWith("rm ", ignoreCase = true) -> {
+                val target = trimmedInput.substring(3).trim()
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal("rm -rf '$target'")
+                    appendBotMessage("Removed '$target'.\n$result")
+                    addLog("[Shell] rm -rf $target")
+                }
             }
-        }
-    }
 
-    private suspend fun executeUserIntent(userText: String, onLog: (String) -> Unit): String = withContext(Dispatchers.Default) {
-        val textLower = userText.lowercase().trim()
-
-        // 1. Очистка всех навыков
-        if (textLower == "delete all skills" || textLower == "clear skills") {
-            skillsManager.clearAllSkills()
-            onLog("[Skill Engine] All skills cleared.")
-            return@withContext "Все навыки успешно удалены!"
-        }
-
-        // 2. Вывод списка сохраненных навыков
-        if (textLower == "list skills" || textLower == "skills") {
-            val skills = skillsManager.getAllSkills()
-            if (skills.isEmpty()) return@withContext "У вас пока нет сохраненных навыков. Используйте 'learn skill Имя = Команда'."
-            return@withContext "Сохраненные навыки:\n" + skills.joinToString("\n") { "- **${it.name}** (${it.actionType}): ${it.description}" }
-        }
-
-        // 3. Запуск навыка: use skill <name> или run skill <name>
-        if (textLower.startsWith("use skill ") || textLower.startsWith("run skill ")) {
-            val parts = userText.substringAfter("skill ").trim().split(" ", limit = 2)
-            val skillName = parts[0].trim()
-            val paramValue = if (parts.size > 1) parts[1].trim() else ""
-
-            val skills = skillsManager.getAllSkills()
-            val skill = skills.find { it.name.equals(skillName, ignoreCase = true) }
-
-            if (skill != null) {
-                onLog("[Skill Engine] Direct execution of skill: ${skill.name}")
-                return@withContext executeSkillInstance(skill, paramValue, onLog)
-            } else {
-                return@withContext "Навык '$skillName' не найден. Сначала создайте его через 'learn skill'."
+            // 6. Поиск файлов (find <query>)
+            trimmedInput.startsWith("find ", ignoreCase = true) -> {
+                val query = trimmedInput.substring(5).trim()
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal("find . -name '*$query*'")
+                    appendBotMessage(if (result.isBlank()) "Nothing found." else result)
+                    addLog("[Shell] find $query")
+                }
             }
-        }
 
-        // 4. Обучение навыку: learn skill <name> = <cmd or url>
-        if (textLower.startsWith("learn skill ") || textLower.startsWith("learn:")) {
-            try {
-                val cleanText = userText.substringAfter("learn skill").substringAfter("learn:").trim()
-                val skillName = cleanText.substringBefore("=").trim()
-                val rest = cleanText.substringAfter("=").trim()
+            // 7. Просмотр списка сохраненных навыков
+            trimmedInput.equals("list skills", ignoreCase = true) ||
+                    trimmedInput.equals("skills", ignoreCase = true) -> {
+                viewModelScope.launch {
+                    val skills = userSkillsManager.getAllSkills()
+                    val response = if (skills.isEmpty()) {
+                        "No skills learned yet. Use 'learn skill <name> = <command>' to add one."
+                    } else {
+                        "Saved skills:\n" + skills.joinToString("\n") { "• ${it.name}: ${it.description}" }
+                    }
+                    appendBotMessage(response)
+                    addLog("[Skill Engine] Listed all saved skills")
+                }
+            }
 
-                val actionType = if (rest.startsWith("http", true) || rest.startsWith("https", true)) "http" else "shell"
-                val config = JSONObject()
+            // 8. Очистка всех навыков
+            trimmedInput.equals("clear skills", ignoreCase = true) -> {
+                viewModelScope.launch {
+                    userSkillsManager.clearAllSkills()
+                    appendBotMessage("All learned skills have been deleted.")
+                    addLog("[Skill Engine] Cleared all skills")
+                }
+            }
 
-                if (actionType == "shell") {
-                    config.put("cmd", rest)
+            // 9. Прямое исполнение shell-команд (exec / sh)
+            trimmedInput.startsWith("exec ", ignoreCase = true) ||
+                    trimmedInput.startsWith("sh ", ignoreCase = true) -> {
+                val command = if (trimmedInput.startsWith("exec ", ignoreCase = true)) {
+                    trimmedInput.substring(5)
                 } else {
-                    config.put("url", rest)
-                    config.put("method", "GET")
-                }
+                    trimmedInput.substring(3)
+                }.trim()
 
-                val finalName = if (skillName.isBlank()) "custom_skill" else skillName
-                skillsManager.addSkill(UserSkill(finalName, "User Learned Skill", actionType, config))
-                onLog("[Skill Engine] Hardcoded Learned skill '$finalName' ($actionType)")
-                return@withContext "Понял! Запомнил навык '$finalName' типа $actionType."
-            } catch (e: Exception) {
-                onLog("[Skill Engine Error] Parse failed: ${e.localizedMessage}")
-                return@withContext "Ошибка при сохранении навыка: ${e.localizedMessage}"
-            }
-        }
-
-        // 5. Прямой запуск shell-скрипта
-        if (textLower.startsWith("execute script ") || textLower.startsWith("run script ")) {
-            val scriptCmd = userText.substringAfter("script").trim()
-            onLog("[Script Runner] Executing: $scriptCmd")
-            return@withContext executeShellCommand(scriptCmd)
-        }
-
-        // --- Если это свободный запрос, отдаем его локальной LLM ---
-        val userSkills = skillsManager.getAllSkills()
-        val customSkillsDesc = if (userSkills.isEmpty()) "None" else userSkills.joinToString("\n") {
-            "- Name: ${it.name} | Type: ${it.actionType}"
-        }
-
-        val systemPrompt = "You are PocketMind Assistant. Output RAW JSON ONLY. No markdown.\n" +
-                "Available skills: $customSkillsDesc\n" +
-                "To execute shell command, output:\n" +
-                "{\"action\": \"execute_command\", \"cmd\": \"ls -la\"}"
-
-        val promptBuilder = StringBuilder()
-        promptBuilder.append("<|im_start|>system\n$systemPrompt<|im_end|>\n")
-        promptBuilder.append("<|im_start|>user\n$userText<|im_end|>\n")
-        promptBuilder.append("<|im_start|>assistant\n")
-
-        onLog("[AI] Parsing intent...")
-        val rawOutput = withTimeoutOrNull(15000L) {
-            generateNative(promptBuilder.toString(), onLog)
-        }?.trim() ?: return@withContext "Error: Execution timed out."
-
-        val jsonStr = extractJson(rawOutput)
-        if (jsonStr != null) {
-            return@withContext executeAndroidTool(jsonStr, onLog)
-        }
-
-        return@withContext rawOutput
-    }
-
-    private fun executeSkillInstance(skill: UserSkill, param: String, onLog: (String) -> Unit): String {
-        return when {
-            skill.actionType.contains("http", true) -> {
-                var url = skill.config.optString("url")
-                if (param.isNotBlank()) {
-                    url = url.replace("{text}", param)
-                }
-                makeHttpRequest(url, skill.config.optString("method", "GET"), "")
-            }
-            skill.actionType.contains("shell", true) -> {
-                var cmd = skill.config.optString("cmd")
-                if (param.isNotBlank()) {
-                    cmd = cmd.replace("{text}", param)
-                }
-                executeShellCommand(cmd)
-            }
-            else -> "Неподдерживаемый тип действия."
-        }
-    }
-
-    private fun extractJson(output: String): String? {
-        val start = output.indexOf("{")
-        if (start == -1) return null
-        val end = output.lastIndexOf("}")
-        return if (end != -1 && end > start) {
-            output.substring(start, end + 1)
-        } else {
-            val trimmed = output.substring(start).trim()
-            if (trimmed.endsWith("}")) trimmed else "$trimmed}"
-        }
-    }
-
-    private fun executeAndroidTool(jsonStr: String, onLog: (String) -> Unit): String {
-        var processedJson = jsonStr.trim()
-        return try {
-            val openBraces = processedJson.count { it == '{' }
-            val closeBraces = processedJson.count { it == '}' }
-            if (openBraces > closeBraces) {
-                processedJson += "}".repeat(openBraces - closeBraces)
-            }
-
-            val json = JSONObject(processedJson)
-            val action = json.optString("action")
-
-            when (action) {
-                "execute_command" -> executeShellCommand(json.optString("cmd"))
-                "http_request" -> makeHttpRequest(json.optString("url"), json.optString("method", "GET"), json.optString("body", ""))
-                else -> "Command completed."
-            }
-        } catch (e: Exception) {
-            if (!processedJson.contains("learn_skill") && (processedJson.contains("execute_command") || processedJson.contains("cmd"))) {
-                val cmdMatch = Regex("\"cmd\"\\s*:\\s*\"([^\"]+)").find(processedJson)
-                if (cmdMatch != null) {
-                    var recoveredCmd = cmdMatch.groupValues[1].trim()
-                    if (recoveredCmd.endsWith("}")) recoveredCmd = recoveredCmd.removeSuffix("}").trim()
-                    if (recoveredCmd.endsWith("\"")) recoveredCmd = recoveredCmd.removeSuffix("\"").trim()
-                    if (recoveredCmd.count { it == '\'' } % 2 != 0) recoveredCmd += "'"
-                    if (recoveredCmd.count { it == '"' } % 2 != 0) recoveredCmd += "\""
-
-                    onLog("[Tool Fallback] Auto-balanced Command: $recoveredCmd")
-                    return executeShellCommand(recoveredCmd)
+                addLog("[Direct Exec] Command: $command")
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal(command)
+                    appendBotMessage(result)
                 }
             }
-            onLog("[Tool Error] ${e.localizedMessage}")
-            "Error: ${e.localizedMessage}"
-        }
-    }
 
-    private fun makeHttpRequest(urlString: String, method: String, body: String): String {
-        return try {
-            val url = URL(urlString)
-            val connection = url.openConnection() as HttpURLConnection
-            connection.requestMethod = method.uppercase()
-            connection.connectTimeout = 5000
-            connection.readTimeout = 5000
+            // 10. Умный запуск скрипта (run <file>)
+            trimmedInput.startsWith("run ", ignoreCase = true) -> {
+                val scriptPath = trimmedInput.substring(4).trim()
+                val command = when {
+                    scriptPath.endsWith(".py", ignoreCase = true) -> "python $scriptPath"
+                    scriptPath.endsWith(".sh", ignoreCase = true) -> "sh $scriptPath"
+                    else -> "sh $scriptPath"
+                }
 
-            if (method.equals("POST", true) || method.equals("PUT", true)) {
-                connection.doOutput = true
-                connection.setRequestProperty("Content-Type", "application/json")
-                OutputStreamWriter(connection.outputStream).use { it.write(body) }
+                addLog("[Script Runner] Executing script: $scriptPath")
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal(command)
+                    appendBotMessage(result)
+                }
             }
 
-            val responseCode = connection.responseCode
-            val stream = if (responseCode in 200..299) connection.inputStream else connection.errorStream
-            val response = stream?.bufferedReader()?.use { it.readText() } ?: "No response body"
-            "HTTP $responseCode Response:\n" + response.take(1000)
-        } catch (e: Exception) {
-            "HTTP Error: ${e.localizedMessage}"
+            // 11. Быстрое чтение файла (cat <file>)
+            trimmedInput.startsWith("cat ", ignoreCase = true) -> {
+                val fileName = trimmedInput.substring(4).trim()
+                addLog("[File Reader] Reading file: $fileName")
+                viewModelScope.launch(Dispatchers.IO) {
+                    val result = executeShellCommandInternal("cat $fileName")
+                    appendBotMessage(result)
+                }
+            }
+
+            // 12. Обучение навыку (learn skill <name> = <cmd>)
+            trimmedInput.startsWith("learn skill ", ignoreCase = true) -> {
+                val content = trimmedInput.substring(12).trim()
+                if (content.contains("=")) {
+                    val parts = content.split("=", limit = 2)
+                    val name = parts[0].trim()
+                    val command = parts[1].trim()
+
+                    val config = JSONObject().put("command", command)
+                    val newSkill = UserSkill(
+                        name = name,
+                        description = "Shell command skill",
+                        actionType = "shell",
+                        config = config
+                    )
+
+                    viewModelScope.launch {
+                        userSkillsManager.addSkill(newSkill)
+                        appendBotMessage("Learned skill '$name' -> '$command'")
+                        addLog("[Skill Engine] Saved skill '$name'")
+                    }
+                } else {
+                    appendBotMessage("Format error. Use: learn skill <name> = <command>")
+                }
+            }
+
+            // 13. Вызов навыка (use skill <name> [arg])
+            trimmedInput.startsWith("use skill ", ignoreCase = true) -> {
+                val fullSkillInput = trimmedInput.substring(10).trim()
+                val parts = fullSkillInput.split(" ", limit = 2)
+                val skillName = parts[0]
+                val param = if (parts.size > 1) parts[1] else ""
+
+                viewModelScope.launch {
+                    val skills = userSkillsManager.getAllSkills()
+                    val foundSkill = skills.find { it.name.equals(skillName, ignoreCase = true) }
+
+                    if (foundSkill != null && foundSkill.actionType == "shell") {
+                        val rawCommand = foundSkill.config.optString("command", "")
+                        val finalCommand = if (rawCommand.contains("{text}")) {
+                            rawCommand.replace("{text}", param)
+                        } else if (param.isNotEmpty()) {
+                            "$rawCommand $param"
+                        } else {
+                            rawCommand
+                        }
+                        addLog("[Skill Engine] Direct execution of skill: $skillName")
+                        val result = executeShellCommandInternal(finalCommand)
+                        appendBotMessage(result)
+                    } else {
+                        appendBotMessage("Skill '$skillName' not found or not a shell skill.")
+                    }
+                }
+            }
+
+            // 14. Справка (help)
+            trimmedInput.equals("help", ignoreCase = true) -> {
+                val helpText = """
+                    Available Direct Commands:
+                    • cd <folder> — Change directory (remembered)
+                    • pwd — Show current working directory
+                    • ls (or dir) — List files in current directory
+                    • mkdir <name> — Create directory
+                    • rm <target> — Remove file or folder
+                    • find <query> — Search files
+                    • exec <cmd> — Run shell command in current dir
+                    • run <file> — Run .py or .sh script automatically
+                    • cat <file> — Read file content
+                    • list skills — Show all saved skills
+                    • learn skill <name> = <cmd> — Train a new skill
+                    • use skill <name> [arg] — Run a saved skill
+                    • clear skills — Delete all saved skills
+                    • help — Show this help message
+                """.trimIndent()
+                appendBotMessage(helpText)
+            }
+
+            // 15. Остальные запросы уходят в локальную LLM
+            else -> {
+                addLog("[AI Engine] Parsing intent via LLM...")
+                sendPromptToLlama(trimmedInput)
+            }
         }
     }
 
-    private fun executeShellCommand(cmd: String): String {
+    /**
+     * Внутренний метод выполнения shell-команд с учетом текущей директории currentDir
+     */
+    private fun executeShellCommandInternal(cmd: String): String {
         return try {
             var formattedCmd = cmd
+
             if (formattedCmd.startsWith("python ", true) || formattedCmd.startsWith("python3 ", true)) {
                 val termuxPython = "/data/data/com.termux/files/usr/bin/python"
                 if (File(termuxPython).exists()) {
-                    formattedCmd = formattedCmd.replaceFirst("python3", termuxPython).replaceFirst("python", termuxPython)
+                    formattedCmd = formattedCmd
+                        .replaceFirst("python3", termuxPython)
+                        .replaceFirst("python", termuxPython)
                 }
             }
 
-            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", formattedCmd))
+            val finalCmd = "cd '$currentDir' && $formattedCmd"
+
+            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
             val reader = BufferedReader(InputStreamReader(process.inputStream))
             val errorReader = BufferedReader(InputStreamReader(process.errorStream))
 
@@ -328,11 +307,44 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             process.waitFor()
-            if (output.isBlank()) "Executed successfully with empty output." else output.toString().take(1500)
+            if (output.isBlank()) "Executed successfully with empty output." else output.toString().trim().take(1500)
         } catch (e: Exception) {
             "Execution error: ${e.localizedMessage}"
         }
     }
+
+    private fun sendPromptToLlama(prompt: String) {
+        _isGenerating.value = true
+        viewModelScope.launch(Dispatchers.IO) {
+            try {
+                val result = generateNative(prompt) { logMessage ->
+                    addLog(logMessage.toString())
+                }
+                appendBotMessage(result)
+            } catch (e: Exception) {
+                appendBotMessage("Generation error: ${e.localizedMessage}")
+            } finally {
+                _isGenerating.value = false
+            }
+        }
+    }
+
+    private fun appendUserMessage(text: String) {
+        _chatMessages.value = _chatMessages.value + ChatMessage("User", text)
+    }
+
+    private fun appendBotMessage(text: String) {
+        _chatMessages.value = _chatMessages.value + ChatMessage("Bot", text)
+    }
+
+    private fun addLog(logText: String) {
+        _logList.value = _logList.value + logText
+    }
+
+    // Нативные методы JNI
+    external fun initModelNative(modelPath: String): Boolean
+    external fun generateNative(prompt: String, logListener: (Any) -> Unit): String
+    external fun freeModelNative()
 
     override fun onCleared() {
         super.onCleared()

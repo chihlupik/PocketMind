@@ -33,7 +33,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         requestStoragePermissions()
-        checkNotificationPermission()
 
         setContent {
             MaterialTheme {
@@ -76,9 +75,16 @@ fun AiChatScreen(viewModel: AiViewModel) {
     var userInput by remember { mutableStateOf("") }
     val logListState = rememberLazyListState()
 
-    LaunchedEffect(viewModel.logList.size) {
-        if (viewModel.logList.isNotEmpty()) {
-            logListState.animateScrollToItem(viewModel.logList.size - 1)
+    // Подписываемся на StateFlow через collectAsState()
+    val chatMessages by viewModel.chatMessages.collectAsState()
+    val logList by viewModel.logList.collectAsState()
+    val statusText by viewModel.statusText.collectAsState()
+    val isAiReady by viewModel.isAiReady.collectAsState()
+    val isGenerating by viewModel.isGenerating.collectAsState()
+
+    LaunchedEffect(logList.size) {
+        if (logList.isNotEmpty()) {
+            logListState.animateScrollToItem(logList.size - 1)
         }
     }
 
@@ -88,9 +94,9 @@ fun AiChatScreen(viewModel: AiViewModel) {
             .padding(8.dp)
     ) {
         Text(
-            text = viewModel.statusText,
+            text = statusText,
             style = MaterialTheme.typography.labelMedium,
-            color = if (viewModel.isAiReady) MaterialTheme.colorScheme.primary else Color.Red,
+            color = if (isAiReady) MaterialTheme.colorScheme.primary else Color.Red,
             modifier = Modifier.padding(bottom = 4.dp)
         )
 
@@ -100,7 +106,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
                 .fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(viewModel.chatMessages) { message ->
+            items(chatMessages) { message ->
                 MessageBubble(message)
             }
         }
@@ -117,7 +123,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
                 onValueChange = { userInput = it },
                 placeholder = { Text("learn skill, run python, read files...") },
                 modifier = Modifier.weight(1f),
-                enabled = viewModel.isAiReady && !viewModel.isGenerating
+                enabled = isAiReady && !isGenerating
             )
 
             Button(
@@ -128,9 +134,9 @@ fun AiChatScreen(viewModel: AiViewModel) {
                         viewModel.processCommand(text)
                     }
                 },
-                enabled = viewModel.isAiReady && userInput.isNotBlank() && !viewModel.isGenerating
+                enabled = isAiReady && userInput.isNotBlank() && !isGenerating
             ) {
-                Text(if (viewModel.isGenerating) "..." else "Send")
+                Text(if (isGenerating) "..." else "Send")
             }
         }
 
@@ -150,7 +156,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
                     .fillMaxSize()
                     .padding(8.dp)
             ) {
-                items(viewModel.logList) { log ->
+                items(logList) { log ->
                     Text(
                         text = log,
                         color = if (log.contains("ERROR") || log.contains("FAILED") || log.contains("[Err]")) Color.Red else Color.Green,
@@ -165,7 +171,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
 
 @Composable
 fun MessageBubble(message: ChatMessage) {
-    val isUser = message.role == "user"
+    val isUser = message.role.equals("user", ignoreCase = true)
     Box(
         modifier = Modifier.fillMaxWidth(),
         contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
