@@ -313,16 +313,29 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun sendPromptToLlama(prompt: String) {
+    private fun sendPromptToLlama(userInput: String) {
         _isGenerating.value = true
+        // Сразу добавляем пустой/думающий пузырек в чат
+        appendBotMessage("...")
+
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val result = generateNative(prompt) { logMessage ->
+                val formattedPrompt = """
+                    <|im_start|>system
+                    You are PocketMind, a precise offline AI assistant and shell automation tool on Android. Answer concisely and helpfully. Never simulate user inputs or generate fake dialogue.<|im_end|>
+                    <|im_start|>user
+                    $userInput<|im_end|>
+                    <|im_start|>assistant
+                """.trimIndent()
+
+                val result = generateNative(formattedPrompt) { logMessage ->
                     addLog(logMessage.toString())
                 }
-                appendBotMessage(result)
+
+                // Обновляем последний пузырек реальным ответом
+                updateLastBotMessage(result.trim())
             } catch (e: Exception) {
-                appendBotMessage("Generation error: ${e.localizedMessage}")
+                updateLastBotMessage("Generation error: ${e.localizedMessage}")
             } finally {
                 _isGenerating.value = false
             }
@@ -335,6 +348,16 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
 
     private fun appendBotMessage(text: String) {
         _chatMessages.value = _chatMessages.value + ChatMessage("Bot", text)
+    }
+
+    private fun updateLastBotMessage(text: String) {
+        val list = _chatMessages.value.toMutableList()
+        if (list.isNotEmpty() && list.last().role == "Bot") {
+            list[list.size - 1] = ChatMessage("Bot", text)
+            _chatMessages.value = list
+        } else {
+            appendBotMessage(text)
+        }
     }
 
     private fun addLog(logText: String) {
