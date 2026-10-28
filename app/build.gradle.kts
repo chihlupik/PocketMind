@@ -1,3 +1,6 @@
+import java.io.InputStream
+import java.net.URL
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -17,14 +20,13 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Сборка только под 64-битный ARM и эмулятор x86_64
         ndk {
-            abiFilters.addAll(listOf("arm64-v8a"))
+            // Добавлен x86_64 для запуска на эмуляторе
+            abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
 
         externalNativeBuild {
             cmake {
-                // Передаем CMake флаги для максимальной производительности (Release + O3)
                 arguments(
                     "-DCMAKE_BUILD_TYPE=Release",
                     "-DANDROID_ARM_NEON=ON",
@@ -76,12 +78,7 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.3")
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
-
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
-
-    // Shizuku API для привилегированного ADB-шелла без root
-    implementation("dev.rikka.shizuku:api:13.1.5")
-    implementation("dev.rikka.shizuku:provider:13.1.5")
 
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
@@ -92,7 +89,6 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
 
-// Скачивание GGUF-модели через curl
 tasks.register("downloadModel") {
     val modelDir = file("src/main/assets")
     val modelFile = file("src/main/assets/qwen2.5-0.5b-instruct-q4_k_m.gguf")
@@ -104,10 +100,17 @@ tasks.register("downloadModel") {
         if (!modelFile.exists()) {
             modelDir.mkdirs()
             println("=== Downloading Qwen 2.5 0.5B GGUF Model... ===")
-            exec {
-                commandLine("curl", "-L", "-o", modelFile.absolutePath, modelUrl)
+            try {
+                // Явно указываем тип InputStream, чтобы Gradle не ругался
+                URL(modelUrl).openStream().use { input: InputStream ->
+                    modelFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                println("=== Model downloaded successfully! ===")
+            } catch (e: Exception) {
+                println("=== Download failed: ${e.message} ===")
             }
-            println("=== Model downloaded successfully! ===")
         } else {
             println("=== Model already present in assets ===")
         }

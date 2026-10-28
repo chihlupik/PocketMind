@@ -17,8 +17,10 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -49,39 +51,48 @@ class MainActivity : ComponentActivity() {
     private fun requestStoragePermissions() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!android.os.Environment.isExternalStorageManager()) {
-                val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                    data = Uri.parse("package:$packageName")
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (e: Exception) {
+                    // Fallback для прошивок без этого экрана
+                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
                 }
-                startActivity(intent)
             }
         } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(this, arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE), 101)
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE),
+                    101
+                )
             }
-        }
-    }
-
-    private fun checkNotificationPermission() {
-        val enabledListeners = Settings.Secure.getString(contentResolver, "enabled_notification_listeners")
-        if (enabledListeners == null || !enabledListeners.contains(packageName)) {
-            val intent = Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)
-            startActivity(intent)
         }
     }
 }
 
 @Composable
 fun AiChatScreen(viewModel: AiViewModel) {
-    var userInput by remember { mutableStateOf("") }
+    var userInput by rememberSaveable { mutableStateOf("") }
+    val chatListState = rememberLazyListState()
     val logListState = rememberLazyListState()
 
-    // Подписываемся на StateFlow через collectAsState()
     val chatMessages by viewModel.chatMessages.collectAsState()
     val logList by viewModel.logList.collectAsState()
     val statusText by viewModel.statusText.collectAsState()
     val isAiReady by viewModel.isAiReady.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
 
+    // Автоскролл чата
+    LaunchedEffect(chatMessages.size) {
+        if (chatMessages.isNotEmpty()) {
+            chatListState.animateScrollToItem(chatMessages.size - 1)
+        }
+    }
+
+    // Автоскролл логов
     LaunchedEffect(logList.size) {
         if (logList.isNotEmpty()) {
             logListState.animateScrollToItem(logList.size - 1)
@@ -96,17 +107,21 @@ fun AiChatScreen(viewModel: AiViewModel) {
         Text(
             text = statusText,
             style = MaterialTheme.typography.labelMedium,
-            color = if (isAiReady) MaterialTheme.colorScheme.primary else Color.Red,
+            color = if (isAiReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error,
             modifier = Modifier.padding(bottom = 4.dp)
         )
 
         LazyColumn(
+            state = chatListState,
             modifier = Modifier
                 .weight(0.6f)
                 .fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
-            items(chatMessages) { message ->
+            items(
+                items = chatMessages,
+                key = { msg -> msg.id }
+            ) { message ->
                 MessageBubble(message)
             }
         }
@@ -126,17 +141,23 @@ fun AiChatScreen(viewModel: AiViewModel) {
                 enabled = isAiReady && !isGenerating
             )
 
-            Button(
-                onClick = {
-                    val text = userInput.trim()
-                    if (text.isNotEmpty()) {
-                        userInput = ""
-                        viewModel.processCommand(text)
-                    }
-                },
-                enabled = isAiReady && userInput.isNotBlank() && !isGenerating
-            ) {
-                Text(if (isGenerating) "..." else "Send")
+            if (isGenerating) {
+                Button(onClick = { viewModel.stopGeneration() }) {
+                    Text("Stop")
+                }
+            } else {
+                Button(
+                    onClick = {
+                        val text = userInput.trim()
+                        if (text.isNotEmpty()) {
+                            userInput = ""
+                            viewModel.processCommand(text)
+                        }
+                    },
+                    enabled = isAiReady && userInput.isNotBlank()
+                ) {
+                    Text("Send")
+                }
             }
         }
 
@@ -159,7 +180,12 @@ fun AiChatScreen(viewModel: AiViewModel) {
                 items(logList) { log ->
                     Text(
                         text = log,
-                        color = if (log.contains("ERROR") || log.contains("FAILED") || log.contains("[Err]")) Color.Red else Color.Green,
+                        color = when {
+                            log.contains("ERROR") || log.contains("FAILED") || log.contains("[Err]") ->
+                                Color.Red
+                            log.contains("[Perf]") -> Color.Cyan
+                            else -> Color.Green
+                        },
                         fontSize = 11.sp,
                         fontFamily = FontFamily.Monospace
                     )
@@ -171,21 +197,24 @@ fun AiChatScreen(viewModel: AiViewModel) {
 
 @Composable
 fun MessageBubble(message: ChatMessage) {
-    val isUser = message.role.equals("user", ignoreCase = true)
+    val isUser = message.role == ChatRole.USER
     Box(
         modifier = Modifier.fillMaxWidth(),
         contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
     ) {
         Surface(
-            color = if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+            color = if (isUser) MaterialTheme.colorScheme.primaryContainer
+            else MaterialTheme.colorScheme.surfaceVariant,
             shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 280.dp)
+            modifier = Modifier.widthIn(max = 320.dp)
         ) {
-            Text(
-                text = message.text,
-                modifier = Modifier.padding(10.dp),
-                style = MaterialTheme.typography.bodyMedium
-            )
+            SelectionContainer {
+                Text(
+                    text = message.text,
+                    modifier = Modifier.padding(10.dp),
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
         }
     }
 }

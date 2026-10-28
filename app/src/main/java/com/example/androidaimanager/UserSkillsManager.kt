@@ -1,8 +1,10 @@
 package com.example.androidaimanager
 
 import android.content.Context
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -17,11 +19,7 @@ data class UserSkill(
 class UserSkillsManager(context: Context) {
     private val skillsFile = File(context.filesDir, "user_skills.json")
     private val mutex = Mutex()
-    private var cachedSkills: List<UserSkill> = emptyList()
-
-    init {
-        loadIntoMemory()
-    }
+    private var cachedSkills: List<UserSkill>? = null
 
     private fun loadIntoMemory() {
         if (!skillsFile.exists()) {
@@ -49,35 +47,38 @@ class UserSkillsManager(context: Context) {
     }
 
     suspend fun getAllSkills(): List<UserSkill> = mutex.withLock {
-        if (cachedSkills.isEmpty() && skillsFile.exists()) {
-            loadIntoMemory()
+        withContext(Dispatchers.IO) {
+            if (cachedSkills == null) loadIntoMemory()
+            cachedSkills ?: emptyList()
         }
-        return cachedSkills
     }
 
     suspend fun addSkill(skill: UserSkill) = mutex.withLock {
-        val current = cachedSkills.toMutableList()
-        current.removeAll { it.name.equals(skill.name, ignoreCase = true) }
-        current.add(skill)
+        withContext(Dispatchers.IO) {
+            if (cachedSkills == null) loadIntoMemory()
+            val current = (cachedSkills ?: emptyList()).toMutableList()
+            current.removeAll { it.name.equals(skill.name, ignoreCase = true) }
+            current.add(skill)
 
-        val jsonArray = JSONArray()
-        current.forEach { item ->
-            val obj = JSONObject().apply {
-                put("name", item.name)
-                put("description", item.description)
-                put("actionType", item.actionType)
-                put("config", item.config)
+            val jsonArray = JSONArray()
+            current.forEach { item ->
+                val obj = JSONObject().apply {
+                    put("name", item.name)
+                    put("description", item.description)
+                    put("actionType", item.actionType)
+                    put("config", item.config)
+                }
+                jsonArray.put(obj)
             }
-            jsonArray.put(obj)
+            skillsFile.writeText(jsonArray.toString(2))
+            cachedSkills = current
         }
-        skillsFile.writeText(jsonArray.toString(2))
-        cachedSkills = current
     }
 
     suspend fun clearAllSkills() = mutex.withLock {
-        if (skillsFile.exists()) {
-            skillsFile.delete()
+        withContext(Dispatchers.IO) {
+            if (skillsFile.exists()) skillsFile.delete()
+            cachedSkills = emptyList()
         }
-        cachedSkills = emptyList()
     }
 }
