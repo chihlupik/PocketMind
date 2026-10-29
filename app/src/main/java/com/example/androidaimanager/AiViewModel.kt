@@ -1,6 +1,7 @@
 package com.example.androidaimanager
 
 import android.app.Application
+import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -11,14 +12,17 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
+import rikka.shizuku.Shizuku
+import rikka.shizuku.ShizukuRemoteProcess
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
 import java.util.UUID
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.coroutineContext
 
-enum class ChatRole { USER, BOT }
+enum class ChatRole { USER, BOT, SYSTEM }
 
 data class ChatMessage(
     val id: String = UUID.randomUUID().toString(),
@@ -45,43 +49,78 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
 
     private val userSkillsManager = UserSkillsManager(application)
 
-    // Текущая рабочая директория (сохраняется между командами)
     private var currentDir: String = "/storage/emulated/0"
-
-    // Флаг остановки генерации
     private val stopRequested = AtomicBoolean(false)
     private var generationJob: Job? = null
-
-    // Termux python
     private val termuxPython = "/data/data/com.termux/files/usr/bin/python"
+
+    // Shizuku state
+    private var shizukuReady = false
+
+    private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
+        if (requestCode == 1001) {
+            shizukuReady = grantResult == PackageManager.PERMISSION_GRANTED
+            addLog("[Shizuku] Permission result: $shizukuReady")
+        }
+    }
 
     init {
         try {
             System.loadLibrary("native-lib")
-            // Проверяем, что рабочая директория доступна
             if (!File(currentDir).canExecute()) {
                 currentDir = getApplication<Application>().filesDir.absolutePath
-                addLog("[App] /storage/emulated/0 недоступна, используем ${currentDir}")
             }
             initAiModel()
+            initShizuku()
         } catch (e: Throwable) {
             _statusText.value = "Native library load failed"
             addLog("[App] FATAL: ${e.localizedMessage}")
         }
     }
 
+    private fun initShizuku() {
+        try {
+            if (Shizuku.pingBinder()) {
+                addLog("[Shizuku] Binder is alive")
+                if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
+                    shizukuReady = true
+                    addLog("[Shizuku] Permission already granted. Shell commands will use ADB privileges.")
+                } else {
+                    addLog("[Shizuku] Permission not granted. Requesting...")
+                    Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
+                    Shizuku.requestPermission(1001)
+                }
+            } else {
+                addLog("[Shizuku] Binder not running. Start Shizuku app first.")
+            }
+        } catch (e: Throwable) {
+            addLog("[Shizuku] Init failed: ${e.localizedMessage}")
+        }
+    }
+
     private fun initAiModel() {
         viewModelScope.launch(Dispatchers.IO) {
             val modelFile = File(getApplication<Application>().filesDir, "qwen2.5-0.5b-instruct-q4_k_m.gguf")
+
+            // Если модели нет в filesDir, копируем её из assets
             if (!modelFile.exists()) {
-                _isAiReady.value = false
-                _statusText.value = "Model file not found"
-                addLog("[App] Model missing: ${modelFile.absolutePath}")
-                return@launch
+                addLog("[App] Model not found in filesDir. Copying from assets...")
+                try {
+                    val inputStream: java.io.InputStream = getApplication<Application>().assets.open("qwen2.5-0.5b-instruct-q4_k_m.gguf")
+                    val outputStream = modelFile.outputStream()
+                    inputStream.copyTo(outputStream)
+                    inputStream.close()
+                    outputStream.close()
+                    addLog("[App] Model copied successfully.")
+                } catch (e: Exception) {
+                    addLog("[App] Failed to copy model from assets: ${e.localizedMessage}")
+                    _isAiReady.value = false
+                    _statusText.value = "Model copy failed"
+                    return@launch
+                }
             }
-            val success = try {
-                initModelNative(modelFile.absolutePath)
-            } catch (e: Throwable) {
+
+            val success = try { initModelNative(modelFile.absolutePath) } catch (e: Throwable) {
                 addLog("[App] initModelNative threw: ${e.localizedMessage}")
                 false
             }
@@ -91,298 +130,73 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /**
-     * Главная точка входа. Базовые команды выполняются мгновенно, без LLM.
-     */
     fun processCommand(input: String) {
         val trimmedInput = input.trim()
         if (trimmedInput.isEmpty()) return
 
-        appendUserMessage(trimmedInput)
+        appendMessage(ChatRole.USER, trimmedInput)
+
+        val directCommands = listOf("dumpsys", "logcat", "pm ", "am ", "settings ", "getprop", "cat ", "ls ", "find ", "grep ", "wc ", "head ", "tail ", "df ", "du ", "top ", "ps ", "netstat ", "ip ", "ping ", "exec ", "sh ")
+        val isDirectCommand = directCommands.any { trimmedInput.startsWith(it, ignoreCase = true) } || trimmedInput.startsWith("`") || trimmedInput.contains(" | ")
 
         when {
-            trimmedInput.startsWith("cd ", ignoreCase = true) -> handleCd(trimmedInput.substring(3).trim())
-
-            trimmedInput.equals("pwd", ignoreCase = true) -> {
-                appendBotMessage(currentDir)
-                addLog("[Shell] pwd -> $currentDir")
+            isDirectCommand -> {
+                val cleanCmd = trimmedInput.removePrefix("exec ").removePrefix("sh ").replace("`", "")
+                handleShell(cleanCmd, "[Direct Exec]")
             }
-
-            trimmedInput.equals("ls", ignoreCase = true) || trimmedInput.equals("dir", ignoreCase = true) ->
-                handleShell("ls -la", "[Shell] ls")
-
-            trimmedInput.startsWith("mkdir ", ignoreCase = true) ->
-                handleShell("mkdir -p ${shellEscape(trimmedInput.substring(6).trim())}", "[Shell] mkdir")
-
-            trimmedInput.startsWith("rm ", ignoreCase = true) ->
-                handleShell("rm -rf ${shellEscape(trimmedInput.substring(3).trim())}", "[Shell] rm")
-
-            trimmedInput.startsWith("find ", ignoreCase = true) ->
-                handleShell("find . -name ${shellEscape("*" + trimmedInput.substring(5).trim() + "*")}", "[Shell] find")
-
-            trimmedInput.equals("list skills", ignoreCase = true) ||
-                    trimmedInput.equals("skills", ignoreCase = true) -> handleListSkills()
-
+            trimmedInput.startsWith("cd ", ignoreCase = true) -> handleCd(trimmedInput.substring(3).trim())
+            trimmedInput.equals("pwd", ignoreCase = true) -> appendMessage(ChatRole.BOT, currentDir)
+            trimmedInput.equals("ls", ignoreCase = true) || trimmedInput.equals("dir", ignoreCase = true) -> handleShell("ls -la", "[Shell] ls")
+            trimmedInput.startsWith("mkdir ", ignoreCase = true) -> handleShell("mkdir -p '${trimmedInput.substring(6).trim()}'", "[Shell] mkdir")
+            trimmedInput.startsWith("rm ", ignoreCase = true) -> handleShell("rm -rf '${trimmedInput.substring(3).trim()}'", "[Shell] rm")
+            trimmedInput.startsWith("find ", ignoreCase = true) -> handleShell("find . -name '*${trimmedInput.substring(5).trim()}*'", "[Shell] find")
+            trimmedInput.equals("list skills", ignoreCase = true) || trimmedInput.equals("skills", ignoreCase = true) -> handleListSkills()
             trimmedInput.equals("clear skills", ignoreCase = true) -> handleClearSkills()
-
-            trimmedInput.startsWith("exec ", ignoreCase = true) ->
-                handleShell(trimmedInput.substring(5).trim(), "[Direct Exec]")
-
-            trimmedInput.startsWith("sh ", ignoreCase = true) ->
-                handleShell(trimmedInput.substring(3).trim(), "[Direct Exec]")
-
             trimmedInput.startsWith("run ", ignoreCase = true) -> handleRunScript(trimmedInput.substring(4).trim())
-
-            trimmedInput.startsWith("cat ", ignoreCase = true) ->
-                handleShell("cat ${shellEscape(trimmedInput.substring(4).trim())}", "[File Reader]")
-
-            trimmedInput.startsWith("learn skill ", ignoreCase = true) ->
-                handleLearnSkill(trimmedInput.substring(12).trim())
-
-            trimmedInput.startsWith("use skill ", ignoreCase = true) ->
-                handleUseSkill(trimmedInput.substring(10).trim())
-
+            trimmedInput.startsWith("cat ", ignoreCase = true) -> handleShell("cat '${trimmedInput.substring(4).trim()}'", "[File Reader]")
+            trimmedInput.startsWith("learn skill ", ignoreCase = true) -> handleLearnSkill(trimmedInput.substring(12).trim())
+            trimmedInput.startsWith("use skill ", ignoreCase = true) -> handleUseSkill(trimmedInput.substring(10).trim())
             trimmedInput.equals("help", ignoreCase = true) -> handleHelp()
-
             else -> sendPromptToLlama(trimmedInput)
         }
     }
 
-    // ---------------------- Command handlers ----------------------
-
-    private fun handleCd(target: String) {
-        if (target.isBlank()) {
-            appendBotMessage("Usage: cd <folder>")
-            return
-        }
-        viewModelScope.launch(Dispatchers.IO) {
-            val candidate = File(currentDir, target).canonicalFile
-            if (!candidate.isDirectory || !candidate.canExecute()) {
-                appendBotMessage("Directory not found or access denied: $target")
-                return@launch
-            }
-            currentDir = candidate.absolutePath
-            appendBotMessage("Directory changed to: $currentDir")
-            addLog("[Shell] cd -> $currentDir")
-        }
-    }
-
-    private fun handleShell(command: String, logPrefix: String) {
-        addLog("$logPrefix Command: $command")
-        viewModelScope.launch(Dispatchers.IO) {
-            val result = executeShellCommandInternal(command)
-            appendBotMessage(result)
-        }
-    }
-
-    private fun handleRunScript(scriptPath: String) {
-        if (scriptPath.isBlank()) {
-            appendBotMessage("Usage: run <file>")
-            return
-        }
-        val command = when {
-            scriptPath.endsWith(".py", ignoreCase = true) -> {
-                if (!File(termuxPython).exists()) {
-                    appendBotMessage("Python not found. Install Termux + python to run .py scripts.")
-                    return
-                }
-                "$termuxPython ${shellEscape(scriptPath)}"
-            }
-            scriptPath.endsWith(".sh", ignoreCase = true) -> "sh ${shellEscape(scriptPath)}"
-            else -> "sh ${shellEscape(scriptPath)}"
-        }
-        addLog("[Script Runner] Executing: $scriptPath")
-        viewModelScope.launch(Dispatchers.IO) {
-            val result = executeShellCommandInternal(command)
-            appendBotMessage(result)
-        }
-    }
-
-    private fun handleListSkills() {
-        viewModelScope.launch {
-            val skills = userSkillsManager.getAllSkills()
-            val response = if (skills.isEmpty()) {
-                "No skills learned yet. Use 'learn skill <name> = <command>' to add one."
-            } else {
-                "Saved skills:\n" + skills.joinToString("\n") { "• ${it.name}: ${it.description}" }
-            }
-            appendBotMessage(response)
-            addLog("[Skill Engine] Listed all saved skills")
-        }
-    }
-
-    private fun handleClearSkills() {
-        viewModelScope.launch {
-            userSkillsManager.clearAllSkills()
-            appendBotMessage("All learned skills have been deleted.")
-            addLog("[Skill Engine] Cleared all skills")
-        }
-    }
-
-    private fun handleLearnSkill(content: String) {
-        if (!content.contains("=")) {
-            appendBotMessage("Format error. Use: learn skill <name> = <command>")
-            return
-        }
-        val parts = content.split("=", limit = 2)
-        val name = parts[0].trim()
-        val command = parts[1].trim()
-        if (name.isBlank() || command.isBlank()) {
-            appendBotMessage("Format error. Use: learn skill <name> = <command>")
-            return
-        }
-
-        val config = JSONObject().put("command", command)
-        val newSkill = UserSkill(
-            name = name,
-            description = "Shell command skill",
-            actionType = "shell",
-            config = config
-        )
-        viewModelScope.launch {
-            userSkillsManager.addSkill(newSkill)
-            appendBotMessage("Learned skill '$name' -> '$command'")
-            addLog("[Skill Engine] Saved skill '$name'")
-        }
-    }
-
-    private fun handleUseSkill(fullSkillInput: String) {
-        if (fullSkillInput.isBlank()) {
-            appendBotMessage("Usage: use skill <name> [arg]")
-            return
-        }
-        val parts = fullSkillInput.split(" ", limit = 2)
-        val skillName = parts[0]
-        val param = if (parts.size > 1) parts[1] else ""
-
-        viewModelScope.launch {
-            val skills = userSkillsManager.getAllSkills()
-            val foundSkill = skills.find { it.name.equals(skillName, ignoreCase = true) }
-
-            if (foundSkill == null || foundSkill.actionType != "shell") {
-                appendBotMessage("Skill '$skillName' not found or not a shell skill.")
-                return@launch
-            }
-
-            val rawCommand = foundSkill.config.optString("command", "")
-            if (rawCommand.isBlank()) {
-                appendBotMessage("Skill '$skillName' has empty command.")
-                return@launch
-            }
-
-            val finalCommand = if (rawCommand.contains("{text}")) {
-                rawCommand.replace("{text}", shellEscape(param))
-            } else if (param.isNotEmpty()) {
-                "$rawCommand ${shellEscape(param)}"
-            } else {
-                rawCommand
-            }
-
-            addLog("[Skill Engine] Executing skill: $skillName")
-            val result = withContext(Dispatchers.IO) {
-                executeShellCommandInternal(finalCommand)
-            }
-            appendBotMessage(result)
-        }
-    }
-
-    private fun handleHelp() {
-        val helpText = """
-            Available Direct Commands:
-            • cd <folder> — Change directory (remembered)
-            • pwd — Show current working directory
-            • ls (or dir) — List files in current directory
-            • mkdir <name> — Create directory
-            • rm <target> — Remove file or folder
-            • find <query> — Search files
-            • exec <cmd> — Run shell command in current dir
-            • run <file> — Run .py or .sh script automatically
-            • cat <file> — Read file content
-            • list skills — Show all saved skills
-            • learn skill <name> = <cmd> — Train a new skill
-            • use skill <name> [arg] — Run a saved skill
-            • clear skills — Delete all saved skills
-            • help — Show this help message
-        """.trimIndent()
-        appendBotMessage(helpText)
-    }
-
-    // ---------------------- Shell execution ----------------------
-
-    /**
-     * Экранирование одинарных кавычек для безопасной вставки в sh -c '...'
-     */
-    private fun shellEscape(s: String): String = "'" + s.replace("'", "'\\''") + "'"
-
-    private fun executeShellCommandInternal(cmd: String): String {
-        return try {
-            var formattedCmd = cmd
-
-            // Подмена python на termux python, если команда начинается с python
-            if (formattedCmd.startsWith("python ", true) || formattedCmd.startsWith("python3 ", true)) {
-                if (File(termuxPython).exists()) {
-                    formattedCmd = formattedCmd
-                        .replaceFirst("python3 ", "$termuxPython ")
-                        .replaceFirst("python ", "$termuxPython ")
-                }
-            }
-
-            val finalCmd = "cd ${shellEscape(currentDir)} && $formattedCmd"
-
-            val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
-            val reader = BufferedReader(InputStreamReader(process.inputStream))
-            val errorReader = BufferedReader(InputStreamReader(process.errorStream))
-
-            val output = StringBuilder()
-            var line: String?
-            while (reader.readLine().also { line = it } != null) {
-                output.append(line).append("\n")
-            }
-            while (errorReader.readLine().also { line = it } != null) {
-                output.append("[Err] ").append(line).append("\n")
-            }
-
-            val exitCode = process.waitFor()
-            if (exitCode != 0 && output.isBlank()) {
-                "Command failed (exit $exitCode)"
-            } else if (output.isBlank()) {
-                "Executed successfully with empty output."
-            } else {
-                output.toString().trim().take(3000)
-            }
-        } catch (e: Exception) {
-            "Execution error: ${e.localizedMessage}"
-        }
-    }
-
-    // ---------------------- LLM ----------------------
-
     private fun sendPromptToLlama(userInput: String) {
         _isGenerating.value = true
         stopRequested.set(false)
-
-        // Добавляем placeholder, чтобы UI сразу отреагировал
-        val placeholderId = appendBotMessage("...")
+        val placeholderId = appendMessage(ChatRole.BOT, "...")
 
         generationJob = viewModelScope.launch(Dispatchers.IO) {
             try {
-                // Собираем историю диалога (последние 10 сообщений)
                 val history = _chatMessages.value
                     .filter { it.id != placeholderId && it.text != "..." }
-                    .takeLast(10)
+                    .takeLast(6)
 
                 val promptBuilder = StringBuilder()
                 promptBuilder.append("<|im_start|>system\n")
                 promptBuilder.append(
-                    "You are PocketMind, a precise offline AI assistant and shell automation tool on Android. " +
-                            "Answer concisely. Never simulate user inputs. " +
-                            "If the user asks to execute a shell command, reply with exactly: EXEC: <command>\n"
+                    "You are PocketMind, an expert Android shell automation assistant. " +
+                            "CRITICAL: You are running on ANDROID. " +
+                            "NEVER use 'pm' for anything except packages (e.g., 'pm list packages'). " +
+                            "For system logs, use 'logcat' (e.g., 'logcat -d -t 50'). " +
+                            "For network devices/hotspot clients, use 'ip neigh' or 'dumpsys connectivity'. " +
+                            "For battery, use 'cat /sys/class/power_supply/battery/capacity'. " +
+                            "For general device info, use 'getprop' or 'dumpsys'. " +
+                            "If the user asks for system info, respond ONLY with: EXEC: <command>. " +
+                            "If a command fails or is blocked, you will receive a SYSTEM message. " +
+                            "Read the SYSTEM message carefully and suggest a DIFFERENT command. Do not repeat the failed command. " +
+                            "For normal conversation, reply normally.\n"
                 )
                 promptBuilder.append("<|im_end|>\n")
 
                 for (msg in history) {
-                    val role = if (msg.role == ChatRole.USER) "user" else "assistant"
-                    promptBuilder.append("<|im_start|>$role\n${msg.text}\n<|im_end|>\n")
+                    val role = when (msg.role) {
+                        ChatRole.USER -> "user"
+                        ChatRole.BOT -> "assistant"
+                        ChatRole.SYSTEM -> "system"
+                    }
+                    val content = if (msg.text.length > 200) msg.text.take(200) + "..." else msg.text
+                    promptBuilder.append("<|im_start|>$role\n$content\n<|im_end|>\n")
                 }
                 promptBuilder.append("<|im_start|>user\n$userInput\n<|im_end|>\n")
                 promptBuilder.append("<|im_start|>assistant\n")
@@ -395,15 +209,24 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                 }
 
                 coroutineContext.ensureActive()
-                val trimmed = result.trim()
+                var trimmed = result.trim()
 
-                // Обработка EXEC: директивы от модели
-                if (trimmed.startsWith("EXEC:", ignoreCase = true)) {
-                    val cmd = trimmed.substringAfter("EXEC:").trim()
-                    updateLastBotMessage("Executing: $cmd")
-                    addLog("[AI Engine] Model requested EXEC: $cmd")
-                    val shellResult = executeShellCommandInternal(cmd)
-                    appendBotMessage(shellResult)
+                if (trimmed.startsWith("```")) {
+                    val firstLineEnd = trimmed.indexOf("\n")
+                    val lastTicks = trimmed.lastIndexOf("```")
+                    if (firstLineEnd != -1 && lastTicks > firstLineEnd) {
+                        trimmed = trimmed.substring(firstLineEnd, lastTicks).trim()
+                    }
+                }
+
+                val execRegex = Regex("(?i)(?:EXEC:|выполни:|команда:)\\s*([^\\n`]+)")
+                val match = execRegex.find(trimmed)
+
+                if (match != null) {
+                    val cmd = match.groupValues[1].trim()
+                    executeCommandWithLoopProtection(cmd)
+                } else if (trimmed.isNotEmpty() && (trimmed.startsWith("pm ") || trimmed.startsWith("dumpsys") || trimmed.startsWith("getprop") || trimmed.startsWith("ls ") || trimmed.startsWith("logcat") || trimmed.startsWith("cat "))) {
+                    executeCommandWithLoopProtection(trimmed)
                 } else {
                     updateLastBotMessage(trimmed.ifBlank { "(empty response)" })
                 }
@@ -418,27 +241,210 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    private fun executeCommandWithLoopProtection(cmd: String) {
+        // 1. Жесткая блокировка pm для всего, кроме пакетов
+        if (cmd.contains("pm ") && !cmd.contains("pm list packages") && !cmd.contains("pm path")) {
+            addLog("[AI Engine] Blocked invalid 'pm' command: $cmd")
+
+            // Принудительно подсказываем модели правильный путь
+            val hint = if (cmd.contains("battery", ignoreCase = true)) {
+                "For battery level, use: cat /sys/class/power_supply/battery/capacity. For temperature: cat /sys/class/power_supply/battery/temp."
+            } else {
+                "Do not use 'pm' for this. Use 'cat /proc/...' or 'dumpsys'."
+            }
+
+            appendMessage(ChatRole.SYSTEM, "Ошибка: команда '$cmd' неверна. $hint")
+            updateLastBotMessage("ИИ ошиблась. Отправляю подсказку...")
+            sendPromptToLlama("The previous command was invalid. $hint")
+            return
+        }
+
+        // 2. Защита от зацикливания
+        val lastBotMessages = _chatMessages.value.filter { it.role == ChatRole.BOT }.takeLast(2)
+        val isLoop = lastBotMessages.any { it.text.contains(cmd, ignoreCase = true) }
+
+        if (isLoop) {
+            addLog("[AI Engine] LOOP DETECTED: $cmd")
+            updateLastBotMessage("Похоже, эта команда не работает. Давай попробуем другой подход?")
+            appendMessage(ChatRole.SYSTEM, "Ошибка: команда '$cmd' уже выполнялась и не сработала. Предложи другую.")
+            return
+        }
+
+        updateLastBotMessage("Executing: $cmd")
+        addLog("[AI Engine] Model requested EXEC: $cmd")
+
+        val shellResult = executeShellCommandInternal(cmd)
+        appendMessage(ChatRole.BOT, shellResult)
+
+        // 3. Проверка на ошибки
+        val isError = shellResult.contains("[Err]") ||
+                shellResult.contains("Permission denied", ignoreCase = true) ||
+                shellResult.contains("not found", ignoreCase = true) ||
+                shellResult.contains("timed out", ignoreCase = true) ||
+                shellResult.contains("Unknown command", ignoreCase = true) ||
+                shellResult.contains("Error:", ignoreCase = true) ||
+                shellResult.contains("Exception", ignoreCase = true) ||
+                shellResult.contains("failed", ignoreCase = true)
+
+        if (isError) {
+            addLog("[AI Engine] Command failed. Adding system feedback.")
+            appendMessage(ChatRole.SYSTEM, "Команда '$cmd' вернула ошибку: $shellResult. Пожалуйста, предложи альтернативную команду (например, из /sys/ или /proc/).")
+        }
+    }
+
+    private fun handleCd(target: String) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val candidate = File(currentDir, target).canonicalFile
+            if (!candidate.isDirectory || !candidate.canExecute()) {
+                appendMessage(ChatRole.BOT, "Directory not found or access denied: $target")
+                return@launch
+            }
+            currentDir = candidate.absolutePath
+            appendMessage(ChatRole.BOT, "Directory changed to: $currentDir")
+        }
+    }
+
+    private fun handleShell(command: String, logPrefix: String) {
+        addLog("$logPrefix Command: $command")
+        viewModelScope.launch(Dispatchers.IO) {
+            val result = executeShellCommandInternal(command)
+            appendMessage(ChatRole.BOT, result)
+        }
+    }
+
+    private fun handleRunScript(scriptPath: String) {
+        val command = when {
+            scriptPath.endsWith(".py", ignoreCase = true) -> {
+                if (!File(termuxPython).exists()) { appendMessage(ChatRole.BOT, "Python not found."); return }
+                "$termuxPython '$scriptPath'"
+            }
+            else -> "sh '$scriptPath'"
+        }
+        handleShell(command, "[Script Runner]")
+    }
+
+    private fun handleListSkills() {
+        viewModelScope.launch {
+            val skills = userSkillsManager.getAllSkills()
+            val response = if (skills.isEmpty()) "No skills learned yet." else "Saved skills:\n" + skills.joinToString("\n") { "• ${it.name}: ${it.description}" }
+            appendMessage(ChatRole.BOT, response)
+        }
+    }
+
+    private fun handleClearSkills() {
+        viewModelScope.launch {
+            userSkillsManager.clearAllSkills()
+            appendMessage(ChatRole.BOT, "All learned skills have been deleted.")
+        }
+    }
+
+    private fun handleLearnSkill(content: String) {
+        if (!content.contains("=")) { appendMessage(ChatRole.BOT, "Format: learn skill <name> = <command>"); return }
+        val parts = content.split("=", limit = 2)
+        val name = parts[0].trim(); val command = parts[1].trim()
+        val newSkill = UserSkill(name, "Shell command skill", "shell", JSONObject().put("command", command))
+        viewModelScope.launch {
+            userSkillsManager.addSkill(newSkill)
+            appendMessage(ChatRole.BOT, "Learned skill '$name' -> '$command'")
+        }
+    }
+
+    private fun handleUseSkill(fullSkillInput: String) {
+        val parts = fullSkillInput.split(" ", limit = 2)
+        val skillName = parts[0]
+        val param = if (parts.size > 1) parts[1] else ""
+        viewModelScope.launch {
+            val skills = userSkillsManager.getAllSkills()
+            val foundSkill = skills.find { it.name.equals(skillName, ignoreCase = true) }
+            if (foundSkill == null) { appendMessage(ChatRole.BOT, "Skill '$skillName' not found."); return@launch }
+            val rawCommand = foundSkill.config.optString("command", "")
+            val finalCommand = if (rawCommand.contains("{text}")) rawCommand.replace("{text}", param) else if (param.isNotEmpty()) "$rawCommand $param" else rawCommand
+            val result = withContext(Dispatchers.IO) { executeShellCommandInternal(finalCommand) }
+            appendMessage(ChatRole.BOT, result)
+        }
+    }
+
+    private fun handleHelp() {
+        val helpText = """
+            • cd <folder>, pwd, ls, mkdir, rm, find, cat
+            • exec <cmd> — Run shell command
+            • run <file> — Run .py or .sh
+            • list/clear skills
+            • learn skill <name> = <cmd>
+            • use skill <name> [arg]
+        """.trimIndent()
+        appendMessage(ChatRole.BOT, helpText)
+    }
+
+    private fun executeShellCommandInternal(cmd: String): String {
+        return try {
+            var formattedCmd = cmd
+            if (formattedCmd.startsWith("python ", true) && File(termuxPython).exists()) {
+                formattedCmd = formattedCmd.replaceFirst("python ", "$termuxPython ")
+            }
+            val finalCmd = "cd '$currentDir' && $formattedCmd"
+
+            val process: Process = if (shizukuReady && Shizuku.pingBinder()) {
+                addLog("[Shell] Executing via Shizuku (ADB) via Reflection")
+                try {
+                    val method = Shizuku::class.java.getDeclaredMethod(
+                        "newProcess",
+                        Array<String>::class.java,
+                        Array<String>::class.java,
+                        String::class.java
+                    )
+                    method.isAccessible = true
+                    val remoteProcess = method.invoke(
+                        null,
+                        arrayOf("sh", "-c", finalCmd),
+                        null,
+                        null
+                    ) as ShizukuRemoteProcess
+                    remoteProcess
+                } catch (e: Exception) {
+                    addLog("[Shizuku] Reflection failed: ${e.message}. Falling back to normal shell.")
+                    Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
+                }
+            } else {
+                Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
+            }
+
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val errorReader = BufferedReader(InputStreamReader(process.errorStream))
+            val output = StringBuilder()
+            var line: String?
+            var errCount = 0
+
+            val finished = process.waitFor(5, TimeUnit.SECONDS)
+            if (!finished) {
+                process.destroyForcibly()
+                return "Command timed out after 5 seconds."
+            }
+
+            while (reader.readLine().also { line = it } != null) output.append(line).append("\n")
+            while (errorReader.readLine().also { line = it } != null) {
+                if (errCount < 10) { output.append("[Err] ").append(line).append("\n"); errCount++ }
+            }
+
+            val exitCode = process.exitValue()
+            if (exitCode != 0 && output.isBlank()) "Command failed (exit $exitCode)"
+            else if (output.isBlank()) "Executed successfully with empty output."
+            else output.toString().trim().take(3000)
+        } catch (e: Exception) {
+            "Execution error: ${e.localizedMessage}"
+        }
+    }
+
     fun stopGeneration() {
         stopRequested.set(true)
-        try {
-            requestStopNative()
-        } catch (_: Throwable) {}
+        try { requestStopNative() } catch (_: Throwable) {}
         generationJob?.cancel()
         _isGenerating.value = false
         updateLastBotMessage("[Stopped]")
     }
 
-    // ---------------------- Helpers ----------------------
-
-    private fun appendUserMessage(text: String): String {
-        val msg = ChatMessage(role = ChatRole.USER, text = text)
-        _chatMessages.value = _chatMessages.value + msg
-        return msg.id
-    }
-
-    @Synchronized
-    private fun appendBotMessage(text: String): String {
-        val msg = ChatMessage(role = ChatRole.BOT, text = text)
+    private fun appendMessage(role: ChatRole, text: String): String {
+        val msg = ChatMessage(role = role, text = text)
         _chatMessages.value = _chatMessages.value + msg
         return msg.id
     }
@@ -450,19 +456,16 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
             list[idx] = list[idx].copy(text = text)
             _chatMessages.value = list
         } else {
-            appendBotMessage(text)
+            appendMessage(ChatRole.BOT, text)
         }
     }
 
     @Synchronized
     private fun addLog(logText: String) {
-        // Ограничиваем размер лога
         val current = _logList.value
         val updated = if (current.size > 500) current.takeLast(400) + logText else current + logText
         _logList.value = updated
     }
-
-    // ---------------------- Native methods ----------------------
 
     external fun initModelNative(modelPath: String): Boolean
     external fun generateNative(prompt: String, logListener: (Any) -> Unit): String
@@ -472,6 +475,7 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         try {
+            Shizuku.removeRequestPermissionResultListener(shizukuPermissionListener)
             requestStopNative()
             freeModelNative()
         } catch (_: Throwable) {}
