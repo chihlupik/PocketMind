@@ -22,6 +22,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.List
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -92,9 +93,12 @@ fun AiChatScreen(viewModel: AiViewModel) {
 
     val chatMessages by viewModel.chatMessages.collectAsState()
     val logList by viewModel.logList.collectAsState()
-    val statusText by viewModel.statusText.collectAsState()
     val isAiReady by viewModel.isAiReady.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
+
+    // Статусы прав
+    val isRootAvailable by viewModel.isRootAvailable.collectAsState()
+    val isShizukuReady by viewModel.isShizukuReady.collectAsState()
 
     var fullScreenText by remember { mutableStateOf<String?>(null) }
 
@@ -114,33 +118,62 @@ fun AiChatScreen(viewModel: AiViewModel) {
         modifier = Modifier
             .fillMaxSize()
             .padding(8.dp)
+            .imePadding()
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text(
-                text = statusText,
-                style = MaterialTheme.typography.labelMedium,
-                color = if (isAiReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
-            )
-            IconButton(
-                onClick = { showLogs = !showLogs },
-                modifier = Modifier.size(32.dp)
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.List,
-                    contentDescription = "Toggle Logs",
-                    tint = if (showLogs) MaterialTheme.colorScheme.primary else Color.Gray
+                Text(
+                    text = if (isAiReady) "Model" else "Model (Init)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (isAiReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
                 )
+                Text(
+                    text = "Root",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (isRootAvailable) Color(0xFF4CAF50) else Color.Gray
+                )
+                Text(
+                    text = "Shizuku",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = if (isShizukuReady) Color(0xFF2196F3) else Color.Gray
+                )
+            }
+
+            Row {
+                IconButton(
+                    onClick = { viewModel.clearChat() },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Delete,
+                        contentDescription = "Clear Chat",
+                        tint = Color.Gray
+                    )
+                }
+                IconButton(
+                    onClick = { showLogs = !showLogs },
+                    modifier = Modifier.size(32.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.List,
+                        contentDescription = "Toggle Logs",
+                        tint = if (showLogs) MaterialTheme.colorScheme.primary else Color.Gray
+                    )
+                }
             }
         }
 
         LazyColumn(
             state = chatListState,
             modifier = Modifier
-                .weight(if (showLogs) 0.6f else 1f)
+                .weight(1f)
                 .fillMaxWidth(),
             verticalArrangement = Arrangement.spacedBy(8.dp)
         ) {
@@ -195,7 +228,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
             Text("Execution Logs:", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
             Surface(
                 modifier = Modifier
-                    .weight(0.4f)
+                    .height(180.dp)
                     .fillMaxWidth(),
                 color = Color.Black,
                 shape = RoundedCornerShape(8.dp)
@@ -264,7 +297,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
                             text = fullScreenText ?: "",
                             color = Color.White,
                             fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp, // Уменьшенный шрифт, как в Termux
+                            fontSize = 11.sp,
                             softWrap = false,
                             modifier = Modifier
                                 .fillMaxSize()
@@ -282,12 +315,17 @@ fun AiChatScreen(viewModel: AiViewModel) {
 fun MessageBubble(message: ChatMessage, onExpand: () -> Unit) {
     val isUser = message.role == ChatRole.USER
 
-    val cleanText = message.text.replace("```shell", "").replace("```", "").trim()
+    val cleanText = message.text
+        .replace("```shell", "")
+        .replace("```", "")
+        .replace("[Err]", "")
+        .trim()
+
     val lineCount = cleanText.lines().size
     val charCount = cleanText.length
 
-    val isExecuting = message.text.startsWith("Executing:") || message.text.startsWith("Развернуть")
-    val showExpandButton = !isExecuting && (lineCount > 8 || charCount > 200)
+    val isExecuting = message.text.startsWith("Executing:")
+    val showExpandButton = !isExecuting && (lineCount > 6 || charCount > 150 || message.text.contains("Exception"))
 
     Box(
         modifier = Modifier.fillMaxWidth(),

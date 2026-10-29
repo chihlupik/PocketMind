@@ -47,6 +47,13 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
     private val _isGenerating = MutableStateFlow(false)
     val isGenerating: StateFlow<Boolean> = _isGenerating
 
+    // Статусы для UI (StateFlow)
+    private val _isRootAvailable = MutableStateFlow(false)
+    val isRootAvailable: StateFlow<Boolean> = _isRootAvailable
+
+    private val _isShizukuReady = MutableStateFlow(false)
+    val isShizukuReady: StateFlow<Boolean> = _isShizukuReady
+
     private val userSkillsManager = UserSkillsManager(application)
 
     private var currentDir: String = "/storage/emulated/0"
@@ -54,12 +61,14 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
     private var generationJob: Job? = null
     private val termuxPython = "/data/data/com.termux/files/usr/bin/python"
 
-    // Shizuku state
+    // Локальные переменные (переименованы, чтобы не конфликтовать с StateFlow)
+    private var hasRoot = false
     private var shizukuReady = false
 
     private val shizukuPermissionListener = Shizuku.OnRequestPermissionResultListener { requestCode, grantResult ->
         if (requestCode == 1001) {
             shizukuReady = grantResult == PackageManager.PERMISSION_GRANTED
+            _isShizukuReady.value = shizukuReady
             addLog("[Shizuku] Permission result: $shizukuReady")
         }
     }
@@ -70,11 +79,26 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
             if (!File(currentDir).canExecute()) {
                 currentDir = getApplication<Application>().filesDir.absolutePath
             }
+            hasRoot = checkRoot()
+            _isRootAvailable.value = hasRoot
+            addLog("[App] Root available: $hasRoot")
             initAiModel()
             initShizuku()
         } catch (e: Throwable) {
             _statusText.value = "Native library load failed"
             addLog("[App] FATAL: ${e.localizedMessage}")
+        }
+    }
+
+    private fun checkRoot(): Boolean {
+        return try {
+            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "id"))
+            val reader = BufferedReader(InputStreamReader(process.inputStream))
+            val output = reader.readLine() ?: ""
+            process.waitFor(2, TimeUnit.SECONDS)
+            output.contains("uid=0")
+        } catch (e: Exception) {
+            false
         }
     }
 
@@ -84,7 +108,8 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                 addLog("[Shizuku] Binder is alive")
                 if (Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED) {
                     shizukuReady = true
-                    addLog("[Shizuku] Permission already granted. Shell commands will use ADB privileges.")
+                    _isShizukuReady.value = true
+                    addLog("[Shizuku] Permission already granted.")
                 } else {
                     addLog("[Shizuku] Permission not granted. Requesting...")
                     Shizuku.addRequestPermissionResultListener(shizukuPermissionListener)
@@ -102,7 +127,6 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         viewModelScope.launch(Dispatchers.IO) {
             val modelFile = File(getApplication<Application>().filesDir, "qwen2.5-0.5b-instruct-q4_k_m.gguf")
 
-            // Если модели нет в filesDir, копируем её из assets
             if (!modelFile.exists()) {
                 addLog("[App] Model not found in filesDir. Copying from assets...")
                 try {
@@ -128,6 +152,11 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
             _statusText.value = if (success) "Model Ready" else "Model Init Failed"
             addLog(if (success) "[App] Model initialized successfully" else "[App] Failed to initialize model")
         }
+    }
+
+    fun clearChat() {
+        _chatMessages.value = emptyList()
+        addLog("[App] Chat cleared")
     }
 
     fun processCommand(input: String) {
@@ -172,31 +201,36 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                     .filter { it.id != placeholderId && it.text != "..." }
                     .takeLast(6)
 
+                val privilegeText = when {
+                    hasRoot -> "You have ROOT access. You can use ANY shell command."
+                    shizukuReady -> "You have ADB privileges via Shizuku. You can use 'dumpsys', 'logcat', and 'pm list packages'."
+                    else -> "CRITICAL: You DO NOT have root or Shizuku. You CANNOT use 'dumpsys', 'logcat', 'pm install'. " +
+                            "For battery, use 'cat /sys/class/power_supply/battery/capacity'. " +
+                            "For RAM, use 'cat /proc/meminfo'. " +
+                            "For CPU, use 'cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq'."
+                }
+
                 val promptBuilder = StringBuilder()
                 promptBuilder.append("<|im_start|>system\n")
                 promptBuilder.append(
-                    "You are PocketMind, an expert Android shell automation assistant. " +
-                            "CRITICAL: You are running on ANDROID. " +
-                            "NEVER use 'pm' for anything except packages (e.g., 'pm list packages'). " +
-                            "For system logs, use 'logcat' (e.g., 'logcat -d -t 50'). " +
-                            "For network devices/hotspot clients, use 'ip neigh' or 'dumpsys connectivity'. " +
-                            "For battery, use 'cat /sys/class/power_supply/battery/capacity'. " +
-                            "For general device info, use 'getprop' or 'dumpsys'. " +
-                            "If the user asks for system info, respond ONLY with: EXEC: <command>. " +
-                            "If a command fails or is blocked, you will receive a SYSTEM message. " +
-                            "Read the SYSTEM message carefully and suggest a DIFFERENT command. Do not repeat the failed command. " +
-                            "For normal conversation, reply normally.\n"
+                    "You are PocketMind, an autonomous Android shell agent. $privilegeText " +
+                            "CRITICAL RULE: Do NOT explain what commands to use. You MUST execute them yourself. " +
+                            "If the user asks a question, respond ONLY with: EXEC: <command>. " +
+                            "For example, if they ask for battery, respond 'EXEC: cat /sys/class/power_supply/battery/capacity'. " +
+                            "If the user asks for something impossible (like installing an app), just say 'I cannot do that without root' and STOP. " +
+                            "For normal conversation (greetings), reply normally.\n"
                 )
                 promptBuilder.append("<|im_end|>\n")
 
                 for (msg in history) {
+                    if (msg.text.length > 300 || msg.text.contains("Exception")) continue
+
                     val role = when (msg.role) {
                         ChatRole.USER -> "user"
                         ChatRole.BOT -> "assistant"
                         ChatRole.SYSTEM -> "system"
                     }
-                    val content = if (msg.text.length > 200) msg.text.take(200) + "..." else msg.text
-                    promptBuilder.append("<|im_start|>$role\n$content\n<|im_end|>\n")
+                    promptBuilder.append("<|im_start|>$role\n${msg.text}\n<|im_end|>\n")
                 }
                 promptBuilder.append("<|im_start|>user\n$userInput\n<|im_end|>\n")
                 promptBuilder.append("<|im_start|>assistant\n")
@@ -217,6 +251,14 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                     if (firstLineEnd != -1 && lastTicks > firstLineEnd) {
                         trimmed = trimmed.substring(firstLineEnd, lastTicks).trim()
                     }
+                }
+
+                if (trimmed.contains("I'm sorry, but I can't assist with that", ignoreCase = true) ||
+                    trimmed.contains("I cannot assist with that", ignoreCase = true)) {
+                    addLog("[AI Engine] Detected safety refusal. Retrying with different prompt...")
+                    val retryPrompt = "<|im_start|>system\nYou are a helpful Android assistant. $privilegeText Answer the user.\n<|im_end|>\n<|im_start|>user\n$userInput\n<|im_end|>\n<|im_start|>assistant\n"
+                    val retryResult = generateNative(retryPrompt) { logMessage -> addLog(logMessage.toString()) }
+                    trimmed = retryResult.trim()
                 }
 
                 val execRegex = Regex("(?i)(?:EXEC:|выполни:|команда:)\\s*([^\\n`]+)")
@@ -242,31 +284,32 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun executeCommandWithLoopProtection(cmd: String) {
-        // 1. Жесткая блокировка pm для всего, кроме пакетов
-        if (cmd.contains("pm ") && !cmd.contains("pm list packages") && !cmd.contains("pm path")) {
+        if (!hasRoot && cmd.contains("pm ") && !cmd.contains("pm list packages") && !cmd.contains("pm path")) {
             addLog("[AI Engine] Blocked invalid 'pm' command: $cmd")
-
-            // Принудительно подсказываем модели правильный путь
-            val hint = if (cmd.contains("battery", ignoreCase = true)) {
-                "For battery level, use: cat /sys/class/power_supply/battery/capacity. For temperature: cat /sys/class/power_supply/battery/temp."
-            } else {
-                "Do not use 'pm' for this. Use 'cat /proc/...' or 'dumpsys'."
-            }
-
-            appendMessage(ChatRole.SYSTEM, "Ошибка: команда '$cmd' неверна. $hint")
-            updateLastBotMessage("ИИ ошиблась. Отправляю подсказку...")
-            sendPromptToLlama("The previous command was invalid. $hint")
+            updateLastBotMessage("Я не могу выполнить эту команду. Установка и обновление пакетов требуют root/ADB. Пожалуйста, установите приложение вручную.")
             return
         }
 
-        // 2. Защита от зацикливания
+        val requiresShizuku = cmd.startsWith("pm ") || cmd.startsWith("dumpsys ") || cmd.startsWith("settings ") || cmd.startsWith("logcat ")
+        if (!hasRoot && requiresShizuku && !shizukuReady) {
+            addLog("[AI Engine] Blocked Shizuku-required command: $cmd")
+            val hint = if (cmd.contains("battery", ignoreCase = true)) {
+                "Используй: cat /sys/class/power_supply/battery/capacity"
+            } else if (cmd.contains("logcat", ignoreCase = true)) {
+                "Используй: dumpsys activity events"
+            } else {
+                "Используй: cat /proc/... или getprop"
+            }
+            appendMessage(ChatRole.BOT, "Эта команда требует прав Shizuku или Root. $hint")
+            return
+        }
+
         val lastBotMessages = _chatMessages.value.filter { it.role == ChatRole.BOT }.takeLast(2)
         val isLoop = lastBotMessages.any { it.text.contains(cmd, ignoreCase = true) }
 
         if (isLoop) {
             addLog("[AI Engine] LOOP DETECTED: $cmd")
             updateLastBotMessage("Похоже, эта команда не работает. Давай попробуем другой подход?")
-            appendMessage(ChatRole.SYSTEM, "Ошибка: команда '$cmd' уже выполнялась и не сработала. Предложи другую.")
             return
         }
 
@@ -276,19 +319,10 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         val shellResult = executeShellCommandInternal(cmd)
         appendMessage(ChatRole.BOT, shellResult)
 
-        // 3. Проверка на ошибки
-        val isError = shellResult.contains("[Err]") ||
-                shellResult.contains("Permission denied", ignoreCase = true) ||
-                shellResult.contains("not found", ignoreCase = true) ||
-                shellResult.contains("timed out", ignoreCase = true) ||
-                shellResult.contains("Unknown command", ignoreCase = true) ||
-                shellResult.contains("Error:", ignoreCase = true) ||
-                shellResult.contains("Exception", ignoreCase = true) ||
-                shellResult.contains("failed", ignoreCase = true)
-
+        val isError = shellResult.contains("[Err]") || shellResult.contains("Error:", ignoreCase = true)
         if (isError) {
-            addLog("[AI Engine] Command failed. Adding system feedback.")
-            appendMessage(ChatRole.SYSTEM, "Команда '$cmd' вернула ошибку: $shellResult. Пожалуйста, предложи альтернативную команду (например, из /sys/ или /proc/).")
+            addLog("[AI Engine] Command failed. Adding short system feedback.")
+            appendMessage(ChatRole.SYSTEM, "Command failed. Suggest a different approach to the user.")
         }
     }
 
@@ -384,29 +418,31 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
             }
             val finalCmd = "cd '$currentDir' && $formattedCmd"
 
-            val process: Process = if (shizukuReady && Shizuku.pingBinder()) {
-                addLog("[Shell] Executing via Shizuku (ADB) via Reflection")
-                try {
-                    val method = Shizuku::class.java.getDeclaredMethod(
-                        "newProcess",
-                        Array<String>::class.java,
-                        Array<String>::class.java,
-                        String::class.java
-                    )
-                    method.isAccessible = true
-                    val remoteProcess = method.invoke(
-                        null,
-                        arrayOf("sh", "-c", finalCmd),
-                        null,
-                        null
-                    ) as ShizukuRemoteProcess
-                    remoteProcess
-                } catch (e: Exception) {
-                    addLog("[Shizuku] Reflection failed: ${e.message}. Falling back to normal shell.")
+            val process: Process = when {
+                hasRoot -> {
+                    addLog("[Shell] Executing via ROOT")
+                    Runtime.getRuntime().exec(arrayOf("su", "-c", finalCmd))
+                }
+                shizukuReady && Shizuku.pingBinder() -> {
+                    addLog("[Shell] Executing via Shizuku (ADB) via Reflection")
+                    try {
+                        val method = Shizuku::class.java.getDeclaredMethod(
+                            "newProcess",
+                            Array<String>::class.java,
+                            Array<String>::class.java,
+                            String::class.java
+                        )
+                        method.isAccessible = true
+                        method.invoke(null, arrayOf("sh", "-c", finalCmd), null, null) as ShizukuRemoteProcess
+                    } catch (e: Exception) {
+                        addLog("[Shizuku] Reflection failed: ${e.message}. Falling back to normal shell.")
+                        Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
+                    }
+                }
+                else -> {
+                    addLog("[Shell] Executing via normal shell")
                     Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
                 }
-            } else {
-                Runtime.getRuntime().exec(arrayOf("sh", "-c", finalCmd))
             }
 
             val reader = BufferedReader(InputStreamReader(process.inputStream))

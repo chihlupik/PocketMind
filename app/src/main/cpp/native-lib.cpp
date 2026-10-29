@@ -89,7 +89,6 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
 
     g_stop.store(false);
 
-    // Пересоздаём контекст, чтобы гарантировать чистый кэш
     if (g_ctx) {
         llama_free(g_ctx);
         g_ctx = nullptr;
@@ -110,14 +109,12 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
 
     const auto* vocab = llama_model_get_vocab(g_model);
 
-    // ВАЖНО: llama_tokenize возвращает отрицательное значение при нехватке места
     std::vector<llama_token> tokens(prompt_text.size() + 64);
     int n_tokens = llama_tokenize(vocab, prompt_text.c_str(),
                                   (int) prompt_text.size(),
                                   tokens.data(), (int) tokens.size(),
                                   true, true);
     if (n_tokens < 0) {
-        // Попробуем ещё раз с большим буфером
         tokens.resize(-n_tokens + 8);
         n_tokens = llama_tokenize(vocab, prompt_text.c_str(),
                                   (int) prompt_text.size(),
@@ -148,7 +145,7 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
     std::string result_text;
-    int max_tokens = 512;
+    int max_tokens = 512; // <--- Увеличено с 128 до 512
     int generated_count = 0;
 
     env->PushLocalFrame(16);
