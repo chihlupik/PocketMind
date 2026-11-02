@@ -22,11 +22,11 @@ Android: 8.0 (API 26) и выше. Оптимально: Android 10+ (где в�
 
 Windows / macOS / Linux (через терминал):
 
-    Клонируем репозиторий:
+Клонируем репозиторий:
     git clone https://github.com/your-username/PocketMind.git
     cd PocketMind
 
-    Собираем проект (для Windows используйте gradlew.bat вместо ./gradlew):
+Собираем проект (для Windows используйте gradlew.bat вместо ./gradlew):
     ./gradlew assembleDebug
     Готовый APK будет лежать в app/build/outputs/apk/debug/app-debug.apk.
     Если cmake или ndk не найдены, проверьте переменные окружения ANDROID_HOME и ANDROID_NDK_HOME.
@@ -34,9 +34,9 @@ Windows / macOS / Linux (через терминал):
 ВОЗМОЖНОСТИ И ИСПОЛЬЗОВАНИЕ
 Агент работает в двух режимах:
 
-    Диалог (Conversation) - обычный чат без выполнения команд.
+Диалог (Conversation) - обычный чат без выполнения команд.
 
-    Выполнение (Execution) - если попросить что-то сделать, ИИ сгенерирует команду с префиксом EXEC:. Каждая команда перед выполнением требует подтверждения в диалоговом окне (Security Approval).
+Выполнение (Execution) - если попросить что-то сделать, ИИ сгенерирует команду с префиксом EXEC:. Каждая команда перед выполнением требует подтверждения в диалоговом окне (Security Approval).
 
 Прямое выполнение (Direct Exec)
 Вы можете вводить команды напрямую (например, ls /sdcard/, curl google.com, cat /proc/cpuinfo). Приложение перехватит их и выполнит без участия нейросети.
