@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import kotlinx.coroutines.flow.first
 
 class MainActivity : ComponentActivity() {
     private val viewModel: AiViewModel by viewModels()
@@ -91,15 +92,28 @@ fun AiChatScreen(viewModel: AiViewModel) {
 
     val isImeVisible = WindowInsets.isImeVisible
 
-    LaunchedEffect(chatMessages.size) {
-        if (chatMessages.isNotEmpty()) chatListState.animateScrollToItem(chatMessages.size - 1)
+    // --- УМНАЯ ПРОКРУТКА ДЛЯ МАЛЕНЬКОГО ОКНА ЛОГОВ ---
+    var wasAtBottomSmall by remember { mutableStateOf(true) }
+    LaunchedEffect(logListState.layoutInfo) {
+        if (!logListState.isScrollInProgress) {
+            val lastVisible = logListState.layoutInfo.visibleItemsInfo.lastOrNull()
+            wasAtBottomSmall = lastVisible == null || lastVisible.index >= logList.size - 2
+        }
     }
     LaunchedEffect(logList.size) {
-        if (logList.isNotEmpty() && showLogs) logListState.animateScrollToItem(logList.size - 1)
+        if (wasAtBottomSmall && showLogs) {
+            logListState.animateScrollToItem(logList.size - 1)
+        }
+    }
+
+    // Автоскролл чата вниз при новых сообщениях
+    LaunchedEffect(chatMessages.size) {
+        if (chatMessages.isNotEmpty()) chatListState.animateScrollToItem(chatMessages.size - 1)
     }
 
     Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
 
+        // 1. ВЕРХНЯЯ ПАНЕЛЬ
         Row(
             modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -117,16 +131,22 @@ fun AiChatScreen(viewModel: AiViewModel) {
             }
         }
 
+        // 2. ЧАТ (С ИСПРАВЛЕННЫМИ ОТСТУПАМИ)
         LazyColumn(
             state = chatListState,
-            modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp)
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+            contentPadding = PaddingValues(vertical = 8.dp)
         ) {
             items(chatMessages, key = { it.id }) { msg ->
                 MessageBubble(message = msg, onExpand = { fullScreenText = it })
             }
         }
 
-        // ПОЛЕ ВВОДА И КНОПКА STOP
+        // 3. ПОЛЕ ВВОДА И КНОПКА STOP/SEND
         Row(
             modifier = Modifier
                 .fillMaxWidth()
@@ -141,7 +161,6 @@ fun AiChatScreen(viewModel: AiViewModel) {
             )
             Spacer(Modifier.width(8.dp))
 
-            // ЛОГИКА КНОПКИ: SEND ИЛИ STOP
             if (isGenerating) {
                 Button(
                     onClick = { viewModel.stopGeneration() },
@@ -159,6 +178,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
             }
         }
 
+        // 4. МАЛЕНЬКОЕ ОКНО ЛОГОВ
         if (showLogs && !isImeVisible) {
             Surface(
                 modifier = Modifier
@@ -188,8 +208,32 @@ fun AiChatScreen(viewModel: AiViewModel) {
         }
     }
 
+    // --- ПОЛНОЭКРАННЫЙ ПРОСМОТР ЛОГОВ ---
     if (showFullScreenLogs) {
         val clipboardManager = LocalClipboardManager.current
+        val vScroll = rememberScrollState()
+        val hScroll = rememberScrollState()
+
+        var wasAtBottomFull by remember { mutableStateOf(true) }
+
+        LaunchedEffect(Unit) {
+            // ИСПОЛЬЗУЕМ ПРАВИЛЬНЫЙ snapshotFlow ИЗ КОМПОУЗА
+            snapshotFlow { vScroll.maxValue }.first { it > 0 }
+            vScroll.scrollTo(vScroll.maxValue)
+            wasAtBottomFull = true
+        }
+
+        LaunchedEffect(vScroll.value) {
+            if (!vScroll.isScrollInProgress) {
+                wasAtBottomFull = vScroll.value >= vScroll.maxValue - 100
+            }
+        }
+        LaunchedEffect(logList.size) {
+            if (wasAtBottomFull) {
+                vScroll.animateScrollTo(vScroll.maxValue)
+            }
+        }
+
         Dialog(onDismissRequest = { showFullScreenLogs = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
             Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
                 Column(modifier = Modifier.fillMaxSize().padding(16.dp).statusBarsPadding()) {
@@ -209,7 +253,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
                     }
                     Spacer(modifier = Modifier.height(8.dp))
                     SelectionContainer(modifier = Modifier.weight(1f)) {
-                        Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState())) {
+                        Column(modifier = Modifier.fillMaxSize().verticalScroll(vScroll).horizontalScroll(hScroll)) {
                             logList.forEach { log ->
                                 Text(
                                     text = log,
@@ -227,6 +271,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
         }
     }
 
+    // --- ПОЛНОЭКРАННЫЙ ПРОСМОТР СООБЩЕНИЯ ---
     if (fullScreenText != null) {
         val clipboardManager = LocalClipboardManager.current
         Dialog(onDismissRequest = { fullScreenText = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
@@ -255,6 +300,7 @@ fun AiChatScreen(viewModel: AiViewModel) {
         }
     }
 
+    // --- ОСТАЛЬНЫЕ ДИАЛОГИ ---
     if (pendingCommand != null) {
         AlertDialog(
             onDismissRequest = { viewModel.cancelCommand() },

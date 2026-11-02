@@ -5,6 +5,7 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
+#include <algorithm> // Для std::min
 #include <android/log.h>
 #include <stdexcept>
 #include "llama.cpp/include/llama.h"
@@ -38,7 +39,6 @@ void sendLogToKotlin(JNIEnv* env, jobject listener, const char* message) {
 }
 
 static int pickThreadCount() {
-    // 2 потока — самый безопасный вариант против вылетов на Snapdragon
     return 2;
 }
 
@@ -76,7 +76,6 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
 
     std::lock_guard<std::mutex> lock(g_mutex);
 
-    // Оборачиваем ВСЕ в try-catch, чтобы предотвратить вылеты
     try {
         if (!g_model) return env->NewStringUTF("Error: Model not initialized.");
 
@@ -88,9 +87,6 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
         }
 
         llama_context_params ctx_params = llama_context_default_params();
-
-        // ГЛАВНЫЙ ФИКС: n_batch и n_ubatch теперь равны n_ctx.
-        // Это предотвращает ошибку GGML_ABORT при обработке длинных промптов.
         ctx_params.n_ctx = 1024;
         ctx_params.n_batch = 1024;
         ctx_params.n_ubatch = 1024;
@@ -128,11 +124,27 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
         }
 
         auto prefill_start = std::chrono::high_resolution_clock::now();
-        llama_batch batch = llama_batch_get_one(tokens.data(), (int)tokens.size());
-        if (llama_decode(g_ctx, batch) != 0) {
-            llama_free(g_ctx); g_ctx = nullptr;
-            return env->NewStringUTF("Error decoding prompt.");
+
+        // ФИКС: Обрабатываем префилл кусками по 128 токенов, чтобы можно было прервать
+        int chunk_size = 128;
+        for (int i = 0; i < (int)tokens.size(); i += chunk_size) {
+            if (g_stop.load()) {
+                llama_free(g_ctx); g_ctx = nullptr;
+                return env->NewStringUTF("[Stopped]");
+            }
+            int n_eval = std::min(chunk_size, (int)tokens.size() - i);
+            llama_batch batch = llama_batch_get_one(tokens.data() + i, n_eval);
+            if (llama_decode(g_ctx, batch) != 0) {
+                llama_free(g_ctx); g_ctx = nullptr;
+                return env->NewStringUTF("Error decoding prompt.");
+            }
         }
+
+        if (g_stop.load()) {
+            llama_free(g_ctx); g_ctx = nullptr;
+            return env->NewStringUTF("[Stopped]");
+        }
+
         auto prefill_end = std::chrono::high_resolution_clock::now();
         double prefill_time = std::chrono::duration<double>(prefill_end - prefill_start).count();
 
@@ -161,7 +173,7 @@ Java_com_example_androidaimanager_AiViewModel_generateNative(
                 result_text.append(buf, n);
                 generated_count++;
             }
-            batch = llama_batch_get_one(&new_token_id, 1);
+            llama_batch batch = llama_batch_get_one(&new_token_id, 1);
             if (llama_decode(g_ctx, batch) != 0) break;
         }
 

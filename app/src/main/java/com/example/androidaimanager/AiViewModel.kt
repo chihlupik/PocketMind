@@ -66,8 +66,8 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
     private val stopRequested = AtomicBoolean(false)
     private var generationJob: Job? = null
 
-    // ID текущей генерации для защиты от Race Condition
     private var currentGenerationId = 0
+    private var generatingSessionId: String? = null
 
     private var hasRoot = false
     private var shizukuReady = false
@@ -254,7 +254,6 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         val trimmedInput = input.trim()
         if (trimmedInput.isEmpty()) return
 
-        // ЗАЩИТА: Если C++ еще не освободил мьютекс, не принимаем новые команды
         if (_isGenerating.value) {
             addLog("[UI] Ignored input: engine is still busy")
             return
@@ -298,7 +297,7 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                 "RULES:\n- NO Linux tools: sudo, apt, systemctl, free, df, /home, /tmp.\n- For file paths use /sdcard/.\n" +
                 "- To write text to a file use echo \"text\" > /sdcard/file.txt. NEVER use touch for text.\n" +
                 "- Use curl for HTTP requests. NEVER use grep or sed after curl.\n" +
-                "- To list files in a directory, use 'ls -la /sdcard/path'. NEVER use df to list files.\n" + // НОВОЕ ПРАВИЛО
+                "- To list files in a directory, use 'ls -la /sdcard/path'. NEVER use df to list files.\n" +
                 "- CRITICAL: If lacking privileges, DO NOT run (dumpsys, pm, am, ps, top). Explain in plain text.\n" +
                 "- DO NOT use curl to fetch system information. Use local files.\n\n" +
                 "ANDROID CHEAT SHEET:\n- Battery: dumpsys battery\n- RAM: cat /proc/meminfo | grep MemAvailable\n" +
@@ -311,7 +310,7 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                 "user: show cpu info\nassistant: EXEC: cat /proc/cpuinfo\n" +
                 "user: get my IP\nassistant: EXEC: curl -s https://api.ipify.org\n" +
                 "user: create test.txt with \"Hello\"\nassistant: EXEC: echo \"Hello\" > /sdcard/Download/test.txt\n" +
-                "user: show files in Downloads folder\nassistant: EXEC: ls -la /sdcard/Download/\n" + // ДОБАВЛЕН ПРИМЕР
+                "user: show files in Downloads folder\nassistant: EXEC: ls -la /sdcard/Download/\n" +
                 "user: show processes\nassistant: I cannot list system processes because that requires Root or Shizuku privileges.\n" +
                 "<|im_end|>\n<|im_start|>user\n$userInput\n<|im_end|>\n<|im_start|>assistant\n"
     }
@@ -324,6 +323,7 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
         currentGenerationId++
         val myGenerationId = currentGenerationId
         val targetSessionId = currentSession.id
+        generatingSessionId = targetSessionId
 
         addLog("[AI] Generating response (ID: $myGenerationId)...")
         appendMessage(ChatRole.BOT, "...")
@@ -333,18 +333,21 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                 val formattedPrompt = buildPrompt(userInput)
                 coroutineContext.ensureActive()
 
-                // Ждем ответа от C++
                 val result = generateNative(formattedPrompt) { addLog(it.toString()) }
 
                 coroutineContext.ensureActive()
 
-                // Если пока мы ждали, была запущена другая генерация, игнорируем этот ответ
                 if (myGenerationId != currentGenerationId) {
-                    addLog("[AI] Generation $myGenerationId ignored (superseded by $currentGenerationId)")
+                    addLog("[AI] Generation $myGenerationId ignored (superseded or stopped)")
                     return@launch
                 }
 
                 var trimmed = result.trim()
+                if (trimmed == "[Stopped]") {
+                    addLog("[AI] Generation halted by native engine")
+                    return@launch
+                }
+
                 if (trimmed.startsWith("```")) {
                     val firstLineEnd = trimmed.indexOf("\n"); val lastTicks = trimmed.lastIndexOf("```")
                     if (firstLineEnd != -1 && lastTicks > firstLineEnd) trimmed = trimmed.substring(firstLineEnd, lastTicks).trim()
@@ -364,14 +367,10 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
                     updateLastBotMessage("[Error]", targetSessionId)
                 }
             } finally {
-                // Обновляем флаги только если это была ПОСЛЕДНЯЯ (актуальная) генерация
                 if (myGenerationId == currentGenerationId) {
                     _isGenerating.value = false
                     generationJob = null
-                    if (stopRequested.get()) {
-                        updateLastBotMessage("[Stopped by user]", targetSessionId)
-                        addLog("[AI] Generation stopped by user")
-                    }
+                    generatingSessionId = null
                 }
             }
         }
@@ -379,13 +378,32 @@ class AiViewModel(application: Application) : AndroidViewModel(application) {
 
     fun stopGeneration() {
         if (!_isGenerating.value) return
+
         stopRequested.set(true)
         try { requestStopNative() } catch (_: Throwable) {}
 
-        // Мгновенно показываем пользователю, что мы останавливаемся
-        updateLastBotMessage("Stopping...", currentSession.id)
-        addLog("[AI] Stop requested. Waiting for engine to halt...")
-        // Флаг _isGenerating НЕ сбрасываем здесь, чтобы не запустить новый промпт раньше времени
+        currentGenerationId++
+
+        val sessionId = generatingSessionId
+        if (sessionId != null) {
+            val session = if (sessionId == currentSession.id) currentSession else _allChats.value.find { it.id == sessionId }
+            if (session != null) {
+                val msgIndex = session.messages.indexOfLast { it.role == ChatRole.BOT && it.text == "..." }
+                if (msgIndex != -1) {
+                    session.messages[msgIndex] = session.messages[msgIndex].copy(text = "[Stopped by user]")
+                    if (session.id == currentSession.id) {
+                        _chatMessages.value = session.messages.toList()
+                    }
+                    viewModelScope.launch { chatHistoryManager.saveSession(session) }
+                }
+            }
+        }
+
+        _isGenerating.value = false
+        generationJob = null
+        generatingSessionId = null
+
+        addLog("[AI] Stop requested by user")
     }
 
     private fun executeCommandWithLoopProtection(cmd: String, targetSessionId: String) {
