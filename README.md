@@ -23,13 +23,15 @@ Android: 8.0 (API 26) и выше. Оптимально: Android 10+ (где в�
 Windows / macOS / Linux (через терминал):
 
 Клонируем репозиторий:
-    git clone https://github.com/your-username/PocketMind.git
-    cd PocketMind
+git clone https://github.com/your-username/PocketMind.git
+cd PocketMind
 
 Собираем проект (для Windows используйте gradlew.bat вместо ./gradlew):
-    ./gradlew assembleDebug
-    Готовый APK будет лежать в app/build/outputs/apk/debug/app-debug.apk.
-    Если cmake или ndk не найдены, проверьте переменные окружения ANDROID_HOME и ANDROID_NDK_HOME.
+
+./gradlew assembleDebug
+
+Готовый APK будет лежать в app/build/outputs/apk/debug/app-debug.apk.
+Если cmake или ndk не найдены, проверьте переменные окружения ANDROID_HOME и ANDROID_NDK_HOME.
 
 ВОЗМОЖНОСТИ И ИСПОЛЬЗОВАНИЕ
 Агент работает в двух режимах:
