@@ -1,19 +1,14 @@
 package com.example.androidaimanager
 
-import android.Manifest
-import android.content.Intent
-import android.content.pm.PackageManager
-import android.net.Uri
-import android.os.Build
 import android.os.Bundle
-import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
-import androidx.core.app.ActivityCompat
-import androidx.core.content.ContextCompat
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -22,8 +17,11 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.List
+import androidx.compose.material.icons.filled.Menu
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -40,182 +38,120 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 
 class MainActivity : ComponentActivity() {
-
     private val viewModel: AiViewModel by viewModels()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        requestStoragePermissions()
-
+        enableEdgeToEdge()
         setContent {
             MaterialTheme {
-                Surface(
-                    modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
-                ) {
+                Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     AiChatScreen(viewModel)
                 }
-            }
-        }
-    }
-
-    private fun requestStoragePermissions() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            if (!android.os.Environment.isExternalStorageManager()) {
-                try {
-                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
-                        data = Uri.parse("package:$packageName")
-                    }
-                    startActivity(intent)
-                } catch (e: Exception) {
-                    startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
-                }
-            }
-        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                ActivityCompat.requestPermissions(
-                    this,
-                    arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE, Manifest.permission.WRITE_EXTERNAL_STORAGE),
-                    101
-                )
             }
         }
     }
 }
 
 @Composable
+fun getLogColor(log: String): Color {
+    return when {
+        log.startsWith("[Err]") || log.contains("FATAL") || log.contains("Error", ignoreCase = true) -> Color.Red
+        log.startsWith("[Perf]") -> Color.Cyan
+        log.startsWith("[App]") || log.startsWith("[UI]") -> Color.White
+        log.startsWith("[User]") -> Color(0xFF81C784)
+        log.startsWith("[AI]") || log.startsWith("[AI Response]") -> Color(0xFF64B5F6)
+        log.startsWith("[Shell]") || log.startsWith("[Direct Exec]") -> Color(0xFFFFB74D)
+        log.startsWith("[Security]") -> Color.Yellow
+        log.startsWith("[Skills]") -> Color(0xFFCE93D8)
+        else -> Color.Green
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
 fun AiChatScreen(viewModel: AiViewModel) {
     var userInput by rememberSaveable { mutableStateOf("") }
-    var showLogs by rememberSaveable { mutableStateOf(true) }
+    var showLogs by rememberSaveable { mutableStateOf(false) }
+    var showHistory by rememberSaveable { mutableStateOf(false) }
+    var showDeleteConfirm by rememberSaveable { mutableStateOf(false) }
+    var showFullScreenLogs by remember { mutableStateOf(false) }
+    var fullScreenText by remember { mutableStateOf<String?>(null) }
 
     val chatListState = rememberLazyListState()
     val logListState = rememberLazyListState()
-
     val chatMessages by viewModel.chatMessages.collectAsState()
     val logList by viewModel.logList.collectAsState()
     val isAiReady by viewModel.isAiReady.collectAsState()
     val isGenerating by viewModel.isGenerating.collectAsState()
-
-    // Статусы прав
+    val allChats by viewModel.allChats.collectAsState()
+    val pendingCommand by viewModel.pendingCommand.collectAsState()
     val isRootAvailable by viewModel.isRootAvailable.collectAsState()
     val isShizukuReady by viewModel.isShizukuReady.collectAsState()
 
-    var fullScreenText by remember { mutableStateOf<String?>(null) }
+    val isImeVisible = WindowInsets.isImeVisible
 
     LaunchedEffect(chatMessages.size) {
-        if (chatMessages.isNotEmpty()) {
-            chatListState.animateScrollToItem(chatMessages.size - 1)
-        }
+        if (chatMessages.isNotEmpty()) chatListState.animateScrollToItem(chatMessages.size - 1)
     }
-
     LaunchedEffect(logList.size) {
-        if (logList.isNotEmpty() && showLogs) {
-            logListState.animateScrollToItem(logList.size - 1)
-        }
+        if (logList.isNotEmpty() && showLogs) logListState.animateScrollToItem(logList.size - 1)
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .padding(8.dp)
-            .imePadding()
-    ) {
+    Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
+
         Row(
-            modifier = Modifier.fillMaxWidth(),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                Text(
-                    text = if (isAiReady) "Model" else "Model (Init)",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (isAiReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error
-                )
-                Text(
-                    text = "Root",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (isRootAvailable) Color(0xFF4CAF50) else Color.Gray
-                )
-                Text(
-                    text = "Shizuku",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = if (isShizukuReady) Color(0xFF2196F3) else Color.Gray
-                )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(if (isAiReady) "Model" else "Model (Init)", style = MaterialTheme.typography.labelMedium, color = if (isAiReady) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.error)
+                Text("Root", style = MaterialTheme.typography.labelMedium, color = if (isRootAvailable) Color(0xFF4CAF50) else Color.Gray)
+                Text("Shizuku", style = MaterialTheme.typography.labelMedium, color = if (isShizukuReady) Color(0xFF2196F3) else Color.Gray)
             }
-
             Row {
-                IconButton(
-                    onClick = { viewModel.clearChat() },
-                    modifier = Modifier.size(32.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Delete,
-                        contentDescription = "Clear Chat",
-                        tint = Color.Gray
-                    )
-                }
-                IconButton(
-                    onClick = { showLogs = !showLogs },
-                    modifier = Modifier.size(32.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.List,
-                        contentDescription = "Toggle Logs",
-                        tint = if (showLogs) MaterialTheme.colorScheme.primary else Color.Gray
-                    )
-                }
+                IconButton(onClick = { showHistory = true }) { Icon(Icons.Default.Menu, contentDescription = "History") }
+                IconButton(onClick = { showLogs = !showLogs }) { Icon(Icons.Default.List, contentDescription = "Logs", tint = if (showLogs) MaterialTheme.colorScheme.primary else Color.Gray) }
+                IconButton(onClick = { showDeleteConfirm = true }) { Icon(Icons.Default.Delete, contentDescription = "Delete Chat", tint = Color.Red) }
             }
         }
 
         LazyColumn(
             state = chatListState,
-            modifier = Modifier
-                .weight(1f)
-                .fillMaxWidth(),
-            verticalArrangement = Arrangement.spacedBy(8.dp)
+            modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 8.dp)
         ) {
-            items(
-                items = chatMessages,
-                key = { msg -> msg.id }
-            ) { message ->
-                MessageBubble(
-                    message = message,
-                    onExpand = { fullScreenText = message.text }
-                )
+            items(chatMessages, key = { it.id }) { msg ->
+                MessageBubble(message = msg, onExpand = { fullScreenText = it })
             }
         }
 
-        Spacer(modifier = Modifier.height(4.dp))
-
+        // ПОЛЕ ВВОДА И КНОПКА STOP
         Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            modifier = Modifier
+                .fillMaxWidth()
+                .imePadding()
+                .padding(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
             OutlinedTextField(
-                value = userInput,
-                onValueChange = { userInput = it },
-                placeholder = { Text("learn skill, run python, read files...") },
-                modifier = Modifier.weight(1f),
-                enabled = isAiReady && !isGenerating
+                value = userInput, onValueChange = { userInput = it },
+                placeholder = { Text("Type a command or question...") },
+                modifier = Modifier.weight(1f), enabled = isAiReady && !isGenerating
             )
+            Spacer(Modifier.width(8.dp))
 
+            // ЛОГИКА КНОПКИ: SEND ИЛИ STOP
             if (isGenerating) {
-                Button(onClick = { viewModel.stopGeneration() }) {
+                Button(
+                    onClick = { viewModel.stopGeneration() },
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.Red)
+                ) {
                     Text("Stop")
                 }
             } else {
                 Button(
-                    onClick = {
-                        val text = userInput.trim()
-                        if (text.isNotEmpty()) {
-                            userInput = ""
-                            viewModel.processCommand(text)
-                        }
-                    },
+                    onClick = { viewModel.processCommand(userInput.trim()); userInput = "" },
                     enabled = isAiReady && userInput.isNotBlank()
                 ) {
                     Text("Send")
@@ -223,33 +159,68 @@ fun AiChatScreen(viewModel: AiViewModel) {
             }
         }
 
-        if (showLogs) {
-            Spacer(modifier = Modifier.height(8.dp))
-            Text("Execution Logs:", style = MaterialTheme.typography.labelSmall, color = Color.Gray)
+        if (showLogs && !isImeVisible) {
             Surface(
                 modifier = Modifier
-                    .height(180.dp)
-                    .fillMaxWidth(),
+                    .height(160.dp)
+                    .fillMaxWidth()
+                    .padding(horizontal = 8.dp)
+                    .padding(bottom = 8.dp)
+                    .navigationBarsPadding()
+                    .clickable { showFullScreenLogs = true },
                 color = Color.Black,
                 shape = RoundedCornerShape(8.dp)
             ) {
-                LazyColumn(
-                    state = logListState,
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .padding(8.dp)
-                ) {
-                    items(logList) { log ->
-                        Text(
-                            text = log,
-                            color = when {
-                                log.contains("ERROR") || log.contains("FAILED") || log.contains("[Err]") -> Color.Red
-                                log.contains("[Perf]") -> Color.Cyan
-                                else -> Color.Green
-                            },
-                            fontSize = 11.sp,
-                            fontFamily = FontFamily.Monospace
-                        )
+                if (logList.isEmpty()) {
+                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Text("No logs yet", color = Color.Gray, fontSize = 12.sp)
+                    }
+                } else {
+                    LazyColumn(state = logListState, modifier = Modifier.fillMaxSize().padding(8.dp)) {
+                        items(logList) { log ->
+                            Text(text = log, color = getLogColor(log), fontSize = 11.sp, fontFamily = FontFamily.Monospace, softWrap = true)
+                        }
+                    }
+                }
+            }
+        } else if (!showLogs) {
+            Spacer(Modifier.navigationBarsPadding())
+        }
+    }
+
+    if (showFullScreenLogs) {
+        val clipboardManager = LocalClipboardManager.current
+        Dialog(onDismissRequest = { showFullScreenLogs = false }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
+                Column(modifier = Modifier.fillMaxSize().padding(16.dp).statusBarsPadding()) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text("System Logs", color = Color.Gray, style = MaterialTheme.typography.titleMedium)
+                        Row {
+                            TextButton(onClick = { clipboardManager.setText(AnnotatedString(logList.joinToString("\n"))) }) {
+                                Text("Copy All", color = Color.Green)
+                            }
+                            TextButton(onClick = { viewModel.clearLogs() }) {
+                                Text("Clear", color = Color.Yellow)
+                            }
+                            TextButton(onClick = { showFullScreenLogs = false }) {
+                                Text("Close", color = Color.Red)
+                            }
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                    SelectionContainer(modifier = Modifier.weight(1f)) {
+                        Column(modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState())) {
+                            logList.forEach { log ->
+                                Text(
+                                    text = log,
+                                    color = getLogColor(log),
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    softWrap = false,
+                                    modifier = Modifier.padding(vertical = 2.dp)
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -258,52 +229,110 @@ fun AiChatScreen(viewModel: AiViewModel) {
 
     if (fullScreenText != null) {
         val clipboardManager = LocalClipboardManager.current
-
-        Dialog(
-            onDismissRequest = { fullScreenText = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            Surface(
-                modifier = Modifier.fillMaxSize(),
-                color = Color.Black
-            ) {
-                Column(modifier = Modifier.fillMaxSize().padding(16.dp)) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text(
-                            "Terminal Output",
-                            color = Color.Gray,
-                            style = MaterialTheme.typography.titleMedium
-                        )
+        Dialog(onDismissRequest = { fullScreenText = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(modifier = Modifier.fillMaxSize(), color = Color.Black) {
+                Column(modifier = Modifier.fillMaxSize().padding(16.dp).statusBarsPadding()) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text("Message Output", color = Color.Gray, style = MaterialTheme.typography.titleMedium)
                         Row {
-                            TextButton(onClick = {
-                                clipboardManager.setText(AnnotatedString(fullScreenText ?: ""))
-                            }) {
-                                Text("Copy All", color = Color.Green)
+                            TextButton(onClick = { clipboardManager.setText(AnnotatedString(fullScreenText ?: "")) }) {
+                                Text("Copy", color = Color.Green)
                             }
                             TextButton(onClick = { fullScreenText = null }) {
                                 Text("Close", color = Color.Red)
                             }
                         }
                     }
-
                     Spacer(modifier = Modifier.height(8.dp))
-
                     SelectionContainer(modifier = Modifier.weight(1f)) {
                         Text(
-                            text = fullScreenText ?: "",
-                            color = Color.White,
-                            fontFamily = FontFamily.Monospace,
-                            fontSize = 11.sp,
-                            softWrap = false,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .verticalScroll(rememberScrollState())
-                                .horizontalScroll(rememberScrollState())
+                            text = fullScreenText ?: "", color = Color.White, fontFamily = FontFamily.Monospace, fontSize = 13.sp, softWrap = false,
+                            modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState())
                         )
+                    }
+                }
+            }
+        }
+    }
+
+    if (pendingCommand != null) {
+        AlertDialog(
+            onDismissRequest = { viewModel.cancelCommand() },
+            title = { Text("Security Approval") },
+            text = { Text("AI wants to execute the following command:\n\n${pendingCommand}") },
+            confirmButton = { TextButton(onClick = { viewModel.confirmCommand() }) { Text("Allow", color = Color.Green) } },
+            dismissButton = { TextButton(onClick = { viewModel.cancelCommand() }) { Text("Deny", color = Color.Red) } }
+        )
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text("Delete Chat") },
+            text = { Text("Are you sure you want to permanently delete this chat history?") },
+            confirmButton = { TextButton(onClick = { viewModel.deleteCurrentChat(); showDeleteConfirm = false }) { Text("Delete", color = Color.Red) } },
+            dismissButton = { TextButton(onClick = { showDeleteConfirm = false }) { Text("Cancel") } }
+        )
+    }
+
+    if (showHistory) {
+        var isSelectionMode by remember { mutableStateOf(false) }
+        var selectedChatIds by remember { mutableStateOf(setOf<String>()) }
+
+        LaunchedEffect(showHistory) {
+            if (!showHistory) { isSelectionMode = false; selectedChatIds = emptySet() }
+        }
+
+        Dialog(onDismissRequest = { showHistory = false }) {
+            Surface(modifier = Modifier.fillMaxSize(0.95f), shape = RoundedCornerShape(12.dp), color = MaterialTheme.colorScheme.surface) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                        Text(if (isSelectionMode) "Select to Delete" else "Chat History", style = MaterialTheme.typography.titleLarge)
+                        Row {
+                            if (isSelectionMode) {
+                                IconButton(onClick = { isSelectionMode = false; selectedChatIds = emptySet() }) { Icon(Icons.Default.Close, contentDescription = "Cancel") }
+                            } else {
+                                IconButton(onClick = { viewModel.startNewChat(); showHistory = false }) { Icon(Icons.Default.Add, contentDescription = "New Chat", tint = MaterialTheme.colorScheme.primary) }
+                                IconButton(onClick = { isSelectionMode = true }) { Icon(Icons.Default.Delete, contentDescription = "Select", tint = Color.Red) }
+                                IconButton(onClick = { showHistory = false }) { Icon(Icons.Default.Close, contentDescription = "Close", tint = Color.Gray) }
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    LazyColumn(modifier = Modifier.weight(1f)) {
+                        items(allChats) { chat ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clickable {
+                                    if (isSelectionMode) {
+                                        selectedChatIds = if (chat.id in selectedChatIds) selectedChatIds - chat.id else selectedChatIds + chat.id
+                                    } else {
+                                        viewModel.loadChat(chat.id); showHistory = false
+                                    }
+                                }.padding(vertical = 16.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                if (isSelectionMode) {
+                                    Checkbox(
+                                        checked = chat.id in selectedChatIds,
+                                        onCheckedChange = { checked ->
+                                            selectedChatIds = if (checked) selectedChatIds + chat.id else selectedChatIds - chat.id
+                                        }
+                                    )
+                                    Spacer(Modifier.width(8.dp))
+                                }
+                                Text(text = chat.title, style = MaterialTheme.typography.bodyLarge)
+                            }
+                            Divider(color = Color.LightGray)
+                        }
+                    }
+
+                    if (isSelectionMode) {
+                        Row(modifier = Modifier.fillMaxWidth().padding(top = 8.dp), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Button(onClick = { viewModel.deleteAllChats(); showHistory = false }, colors = ButtonDefaults.buttonColors(containerColor = Color.Red)) { Text("Delete All") }
+                            Button(onClick = { viewModel.deleteSelectedChats(selectedChatIds.toList()); isSelectionMode = false; selectedChatIds = emptySet() }, enabled = selectedChatIds.isNotEmpty()) { Text("Delete (${selectedChatIds.size})") }
+                        }
                     }
                 }
             }
@@ -312,57 +341,26 @@ fun AiChatScreen(viewModel: AiViewModel) {
 }
 
 @Composable
-fun MessageBubble(message: ChatMessage, onExpand: () -> Unit) {
+fun MessageBubble(message: ChatMessage, onExpand: (String) -> Unit) {
     val isUser = message.role == ChatRole.USER
-
-    val cleanText = message.text
-        .replace("```shell", "")
-        .replace("```", "")
-        .replace("[Err]", "")
-        .trim()
-
+    val cleanText = message.text.replace("```shell", "").replace("```", "").trim()
     val lineCount = cleanText.lines().size
     val charCount = cleanText.length
+    val showExpandButton = lineCount > 6 || charCount > 150 || message.text.contains("Exception")
 
-    val isExecuting = message.text.startsWith("Executing:")
-    val showExpandButton = !isExecuting && (lineCount > 6 || charCount > 150 || message.text.contains("Exception"))
-
-    Box(
-        modifier = Modifier.fillMaxWidth(),
-        contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart
-    ) {
-        Surface(
-            color = if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
-            shape = RoundedCornerShape(12.dp),
-            modifier = Modifier.widthIn(max = 320.dp)
-        ) {
+    Box(modifier = Modifier.fillMaxWidth(), contentAlignment = if (isUser) Alignment.CenterEnd else Alignment.CenterStart) {
+        Surface(color = if (isUser) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant, shape = RoundedCornerShape(12.dp), modifier = Modifier.widthIn(max = 320.dp)) {
             Column(modifier = Modifier.padding(10.dp)) {
                 if (showExpandButton) {
                     SelectionContainer {
-                        Text(
-                            text = message.text,
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 6,
-                            overflow = TextOverflow.Ellipsis,
-                            softWrap = true
-                        )
+                        Text(text = message.text, style = MaterialTheme.typography.bodyMedium, maxLines = 6, overflow = TextOverflow.Ellipsis)
                     }
                     Spacer(modifier = Modifier.height(4.dp))
-                    TextButton(
-                        onClick = onExpand,
-                        contentPadding = PaddingValues(0.dp),
-                        modifier = Modifier.height(24.dp)
-                    ) {
-                        Text("Развернуть полностью", fontSize = 12.sp)
+                    TextButton(onClick = { onExpand(message.text) }, contentPadding = PaddingValues(0.dp), modifier = Modifier.height(24.dp)) {
+                        Text("Expand", fontSize = 12.sp)
                     }
                 } else {
-                    SelectionContainer {
-                        Text(
-                            text = message.text,
-                            style = MaterialTheme.typography.bodyMedium,
-                            softWrap = true
-                        )
-                    }
+                    Text(text = message.text, style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }

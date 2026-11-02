@@ -11,10 +11,11 @@
         android:allowBackup="true"
         android:label="PocketMind"
         android:supportsRtl="true"
+        android:largeHeap="true"
         android:requestLegacyExternalStorage="true"
         android:theme="@android:style/Theme.Material.Light.NoActionBar">
 
-        <!-- Провайдер Shizuku (без android:permission, иначе не запустится) -->
+        <!-- Провайдер Shizuku -->
         <provider
             android:name="rikka.shizuku.ShizukuProvider"
             android:authorities="${applicationId}.shizuku"
@@ -22,9 +23,11 @@
             android:enabled="true"
             android:exported="true" />
 
+        <!-- Обрати внимание на android:windowSoftInputMode="adjustResize" -->
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:windowSoftInputMode="adjustResize"
             android:configChanges="orientation|screenSize|keyboardHidden">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />

@@ -12,7 +12,7 @@ import java.io.File
 data class UserSkill(
     val name: String,
     val description: String,
-    val actionType: String, // "http", "shell"
+    val actionType: String,
     val config: JSONObject
 )
 
