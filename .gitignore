@@ -10,3 +10,5 @@
 
 # Файл модели GGUF (скачивается автоматически при сборке через curl)
 app/src/main/assets/*.gguf
+
+/app/release

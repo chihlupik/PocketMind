@@ -1,59 +1,63 @@
-PocketMind: Локальный офлайн ИИ-агент для Android
+PocketMind: Local Offline AI Agent for Android
 
-ОПИСАНИЕ
-PocketMind - это локальный ИИ-агент, работающий полностью офлайн на базе llama.cpp. Он способен вести диалог, а также выполнять shell-команды на устройстве через естественный язык, используя подтверждение действий пользователем.
+DESCRIPTION
+PocketMind is a local AI agent that works completely offline based on llama.cpp. It is capable of holding a conversation, as well as executing shell commands on the device through natural language, utilizing user confirmation for actions.
 
-ТЕХНИЧЕСКИЙ СТЕК
-Язык: Kotlin, C++ (JNI)
+TECH STACK
+Languages: Kotlin, C++ (JNI)
 UI: Jetpack Compose (Material 3)
-Архитектура: MVVM, StateFlow, Coroutines
-Ядро ИИ: llama.cpp (сборка через CMake)
-Модель: Qwen2.5-0.5B-Instruct (формат GGUF, квантование Q4_K_M)
-Сборка: Gradle (Kotlin DSL), CMake 3.22.1, NDK r27
+Architecture: MVVM, StateFlow, Coroutines
+AI Core: llama.cpp (built via CMake)
+Model: Qwen2.5-0.5B-Instruct (GGUF format, Q4_K_M quantization)
+Build System: Gradle (Kotlin DSL), CMake 3.22.1, NDK r27
 
-МИНИМАЛЬНЫЕ ТРЕБОВАНИЯ
-Android: 8.0 (API 26) и выше. Оптимально: Android 10+ (где встроена утилита curl).
-ОЗУ: от 3 ГБ (модели требуется около 1.5 ГБ свободной памяти).
-Архитектура: arm64-v8a (основные устройства) и x86_64 (эмуляторы).
-Где не пойдет: На устройствах с 32-битной архитектурой (ARMv7) или на старых версиях Android без доступа к файловой системе (хотя бы к папке /sdcard/).
+MINIMUM REQUIREMENTS
+Android: 8.0 (API 26) and above. Optimal: Android 10+ (where curl utility is built-in).
+RAM: 3 GB or more (the model requires about 1.5 GB of free memory).
+Architecture: arm64-v8a (most devices) and x86_64 (emulators).
+Where it won't work: On 32-bit architecture devices (ARMv7) or older Android versions without file system access (at least to the /sdcard/ folder).
 
-СБОРКА И ЗАПУСК
-Для сборки требуются установленные JDK 17, Android SDK (API 35) и Android NDK. CMake и Ninja обычно устанавливаются через SDK Manager в Android Studio. Модель (около 500 МБ) скачивается автоматически при первой сборке (таска downloadModel в build.gradle.kts) и кладется в папку assets.
+BUILD AND RUN
+Building requires installed JDK 17, Android SDK (API 35), and Android NDK. CMake and Ninja are typically installed via SDK Manager in Android Studio. The model (about 500 MB) is downloaded automatically on the first build (downloadModel task in build.gradle.kts) and placed in the assets folder.
 
-Windows / macOS / Linux (через терминал):
+Windows / macOS / Linux (via terminal):
 
-Клонируем репозиторий:
-git clone https://github.com/your-username/PocketMind.git
+Clone the repository:
+git clone https://github.com/chihlupik/PocketMind.git
 cd PocketMind
 
-Собираем проект (для Windows используйте gradlew.bat вместо ./gradlew):
+Build the project (for Windows use gradlew.bat instead of ./gradlew):
 
 ./gradlew assembleDebug
 
-Готовый APK будет лежать в app/build/outputs/apk/debug/app-debug.apk.
-Если cmake или ndk не найдены, проверьте переменные окружения ANDROID_HOME и ANDROID_NDK_HOME.
+The ready APK will be located at app/build/outputs/apk/debug/app-debug.apk.
+If cmake or ndk are not found, check the ANDROID_HOME and ANDROID_NDK_HOME environment variables.
 
-ВОЗМОЖНОСТИ И ИСПОЛЬЗОВАНИЕ
-Агент работает в двух режимах:
+FEATURES AND USAGE
+The agent operates in two modes:
 
-Диалог (Conversation) - обычный чат без выполнения команд.
+Conversation - regular chat without executing commands.
 
-Выполнение (Execution) - если попросить что-то сделать, ИИ сгенерирует команду с префиксом EXEC:. Каждая команда перед выполнением требует подтверждения в диалоговом окне (Security Approval).
+Execution - if you ask it to do something, the AI will generate a command with the EXEC: prefix. Every command requires confirmation in a dialog window (Security Approval) before execution.
 
-Прямое выполнение (Direct Exec)
-Вы можете вводить команды напрямую (например, ls /sdcard/, curl google.com, cat /proc/cpuinfo). Приложение перехватит их и выполнит без участия нейросети.
+Direct Exec
+You can enter commands directly (e.g., ls /sdcard/, curl google.com, cat /proc/cpuinfo). The app will intercept them and execute them without the neural network.
 
-Скиллы (Skills)
-Вы можете обучать ИИ кастомным командам.
-Создать скилл: learn skill [name] [command]
-Пример: learn skill flash echo "flashlight on"
-Использовать скилл: use skill [name] [args]
-Пример: use skill flash
+Skills
+You can teach the AI custom commands.
 
-Права доступа
-ИИ знает о наличии Root и Shizuku. Если прав нет, она откажется выполнять системные команды (dumpsys, pm, ps) и объяснит причину. С Root агент получает полный контроль над устройством.
+Create a skill: learn skill [name] [command]
 
-ИЗВЕСТНЫЕ ОГРАНИЧЕНИЯ
-Модель Qwen 0.5B очень мала и склонна к галлюцинациям. Системный промпт содержит жесткие правила (Cheat Sheet), чтобы направлять ее.
-Вывод shell-команд ограничен 3000 символами для предотвращения OOM (Out of Memory).
-Нет поддержки потоковой передачи (streaming) текста от ИИ - ответ появляется целиком после завершения генерации.
+Example: learn skill flash echo "flashlight on"
+
+Use a skill: use skill [name] [args]
+
+Example: use skill flash
+
+Privileges
+The AI is aware of Root and Shizuku availability. If privileges are missing, it will refuse to execute system commands (dumpsys, pm, ps) and explain the reason. With Root, the agent gains full control over the device.
+
+KNOWN LIMITATIONS
+The Qwen 0.5B model is very small and prone to hallucinations. The system prompt contains strict rules (Cheat Sheet) to guide it.
+Shell command output is limited to 3000 characters to prevent OOM (Out of Memory).
+No support for streaming text from the AI - the response appears in full after generation is complete.
